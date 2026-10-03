@@ -94,6 +94,7 @@ class ModelKwargs(TypedDict, total=False):
     include: list[str] | None
     output_version: Literal["responses/v1"] | None
     model_kwargs: dict[str, object] | None
+    extra_body: dict[str, object] | None  # 👈 【新增这一行】：允许向底层透传请求体参数
 
 
 _ANTHROPIC_EFFORTS: set[AnthropicEffort] = {"low", "medium", "high", "xhigh", "max"}
@@ -133,6 +134,30 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
     model_kwargs.setdefault("max_retries", DEFAULT_MAX_RETRIES)
     if model_id.startswith(_TIMEOUT_PROVIDER_PREFIXES):
         model_kwargs.setdefault("timeout", DEFAULT_REQUEST_TIMEOUT_SECONDS)
+
+    if model_id.startswith("local:"):
+        model_name = model_id.split(":", 1)[1]
+        model_kwargs["model_provider"] = "openai"
+        model_kwargs["base_url"] = os.environ.get("LOCAL_LLM_BASE_URL", "http://localhost:8080/v1")
+        model_kwargs["api_key"] = os.environ.get("LOCAL_LLM_API_KEY", "dummy")
+        model_kwargs.pop("use_responses_api", None)
+        model_kwargs.pop("reasoning", None)
+        model_kwargs.pop("thinking", None)
+        model_kwargs.pop("effort", None)
+
+        # 👈 【新增以下逻辑】：注入 Qwen/DashScope/vLLM 的思考开关
+        extra_body = dict(model_kwargs.get("extra_body") or {})
+        # 从环境变量或者默认开启思考模式
+        enable_thinking = os.environ.get("LOCAL_LLM_ENABLE_THINKING", "true").lower() in ("true", "1")
+        if enable_thinking:
+            extra_body["enable_thinking"] = True
+            # 如果是本地 vLLM，部分框架使用 chat_template_kwargs
+            extra_body.setdefault("chat_template_kwargs", {"enable_thinking": True})
+        
+        if extra_body:
+            model_kwargs["extra_body"] = extra_body
+
+        return init_chat_model(model=model_name, **model_kwargs)
 
     if model_id.startswith("openai:"):
         model_kwargs["base_url"] = (
@@ -320,6 +345,11 @@ def provider_model_kwargs(
         effort = fireworks_reasoning_effort_for(profile_effort)
         if effort is not None:
             kwargs["model_kwargs"] = {"reasoning_effort": effort}
+    # 👈 【新增此分支】：处理本地/Qwen 模型的思考开关
+    elif model_id.startswith("local:"):
+        # 只要 profile 没有显式设为 "none"，就打开思考
+        if profile_effort != "none":
+            kwargs["extra_body"] = {"enable_thinking": True}
     return kwargs
 
 

@@ -16,7 +16,7 @@ import os
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from langgraph_sdk import get_client
+from ..utils.thread_ops import langgraph_client
 from pydantic import BaseModel, field_validator
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ class SandboxSettingsUpdate(BaseModel):
 
 
 def _client():
-    return get_client()
+    return langgraph_client()
 
 
 def env_base_snapshot_id() -> str | None:

@@ -18,6 +18,32 @@ from typing import Any, Literal, cast
 
 logger = logging.getLogger(__name__)
 
+# 针对 langgraph_sdk 中的 _ReadRuntime 和 _WriteRuntime 进行正确的 monkeypatch
+try:
+    from langgraph_sdk.runtime import _ReadRuntime
+
+    if not hasattr(_ReadRuntime, "override"):
+
+        def _dummy_override(self, *args, **kwargs):
+            return self
+
+        _ReadRuntime.override = _dummy_override
+        logger.info("Successfully monkeypatched langgraph_sdk.runtime._ReadRuntime.override")
+except Exception:
+    logger.warning("Failed to monkeypatch langgraph_sdk.runtime._ReadRuntime.override")
+
+try:
+    from langgraph_sdk.runtime import _WriteRuntime
+
+    if not hasattr(_WriteRuntime, "override"):
+
+        def _dummy_override(self, *args, **kwargs):
+            return self
+
+        _WriteRuntime.override = _dummy_override
+except Exception:
+    pass
+
 from langgraph.graph.state import RunnableConfig
 from langgraph.pregel import Pregel
 from langgraph.runtime import Runtime
