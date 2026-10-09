@@ -100,6 +100,77 @@ class ModelKwargs(TypedDict, total=False):
 _ANTHROPIC_EFFORTS: set[AnthropicEffort] = {"low", "medium", "high", "xhigh", "max"}
 
 
+_LOCAL_OVERFLOW_PATTERNS = (
+    "maximum context length",
+    "exceeds the context length",
+    "context length exceeded",
+    "context length is exceeded",
+    "context window exceeded",
+    "context window limit exceeded",
+    "exceed the model's context length",
+)
+_local_overflow_installed = False
+
+
+def _is_context_overflow_error(e: BaseException) -> bool:
+    """Detect OpenAI-compatible (vLLM/TGI/llama.cpp) context-overflow rejections."""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and isinstance(err.get("message"), str):
+            body = err
+    text = f"{getattr(e, 'message', None) or ''} {body}".lower()
+    if any(pattern in text for pattern in _LOCAL_OVERFLOW_PATTERNS):
+        return True
+    return "input_tokens" in text and "context" in text
+
+
+def install_context_overflow_error_patch() -> None:
+    """Wrap langchain-openai's BadRequest handling so vLLM-style context overflows become ContextOverflowError.
+
+    Without this, the deepagents summarization middleware's overflow-retry fallback never engages.
+    """
+    global _local_overflow_installed
+    if _local_overflow_installed:
+        return
+    try:
+        from langchain_openai.chat_models import base as lo_base
+    except ImportError:
+        return
+    if getattr(lo_base, "_open_swe_overflow_patched", False):
+        _local_overflow_installed = True
+        return
+
+    original = lo_base._handle_openai_bad_request
+
+    def _patched_handle_openai_bad_request(e: BaseException) -> None:
+        try:
+            original(e)
+            return
+        except lo_base.ContextOverflowError:
+            raise
+        except BaseException as raised:
+            # The original handler re-raises unmatched errors via a bare
+            # `raise`; outside an exception context that surfaces as
+            # RuntimeError, so fall back to the error passed in.
+            source = (
+                e
+                if isinstance(raised, RuntimeError) and "No active exception" in str(raised)
+                else raised
+            )
+            if _is_context_overflow_error(source):
+                raise lo_base.OpenAIContextOverflowError(
+                    message=str(getattr(source, "message", None) or source),
+                    response=getattr(source, "response", None),
+                    body=getattr(source, "body", None),
+                ) from source
+            raise source from None
+
+    lo_base._handle_openai_bad_request = _patched_handle_openai_bad_request
+    lo_base._open_swe_overflow_patched = True
+    _local_overflow_installed = True
+
+
 def _coerce_openai_chat_completions_kwargs(model_kwargs: dict[str, object]) -> None:
     if model_kwargs.get("use_responses_api") is not False:
         return
@@ -148,12 +219,15 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
         # 👈 【新增以下逻辑】：注入 Qwen/DashScope/vLLM 的思考开关
         extra_body = dict(model_kwargs.get("extra_body") or {})
         # 从环境变量或者默认开启思考模式
-        enable_thinking = os.environ.get("LOCAL_LLM_ENABLE_THINKING", "true").lower() in ("true", "1")
+        enable_thinking = os.environ.get("LOCAL_LLM_ENABLE_THINKING", "true").lower() in (
+            "true",
+            "1",
+        )
         if enable_thinking:
             extra_body["enable_thinking"] = True
             # 如果是本地 vLLM，部分框架使用 chat_template_kwargs
             extra_body.setdefault("chat_template_kwargs", {"enable_thinking": True})
-        
+
         if extra_body:
             model_kwargs["extra_body"] = extra_body
 
@@ -214,6 +288,7 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
     else:
         model = init_chat_model(model=model_id, **cast(dict[str, Any], model_kwargs))
     _MODEL_CACHE[key] = model
+    install_context_overflow_error_patch()
     return model
 
 
