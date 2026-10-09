@@ -205,6 +205,9 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
     model_kwargs.setdefault("max_retries", DEFAULT_MAX_RETRIES)
     if model_id.startswith(_TIMEOUT_PROVIDER_PREFIXES):
         model_kwargs.setdefault("timeout", DEFAULT_REQUEST_TIMEOUT_SECONDS)
+    # The local: branch below returns early, so install the overflow patch here
+    # rather than at the shared tail; it is idempotent and cheap.
+    install_context_overflow_error_patch()
 
     if model_id.startswith("local:"):
         model_name = model_id.split(":", 1)[1]
@@ -288,7 +291,6 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
     else:
         model = init_chat_model(model=model_id, **cast(dict[str, Any], model_kwargs))
     _MODEL_CACHE[key] = model
-    install_context_overflow_error_patch()
     return model
 
 

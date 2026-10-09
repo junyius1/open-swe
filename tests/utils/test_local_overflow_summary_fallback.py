@@ -66,6 +66,44 @@ def test_unrelated_bad_request_is_not_reclassified() -> None:
         )
 
 
+def test_local_model_build_installs_overflow_patch() -> None:
+    """The local: branch of make_model returns early, before the shared tail.
+
+    This is the exact regression from the reported bug: the install was placed at the
+    shared tail, so local models never got the patch and their vLLM overflow escaped as
+    a raw BadRequestError. Installing at the top of make_model covers every branch.
+    """
+    from unittest.mock import patch as _patch
+
+    from langchain_openai.chat_models import base as lo_base
+
+    # Simulate a fresh process: drop any prior install so the local: path must do it.
+    model_utils._local_overflow_installed = False
+    lo_base.__dict__.pop("_open_swe_overflow_patched", None)
+    # Reset the wrapped handler to the pristine original if a prior test wrapped it, so
+    # we observe a clean install from the local path.
+    import importlib
+
+    importlib.reload(lo_base)
+
+    captured: dict[str, object] = {}
+
+    def _fake_init(model: str, **kwargs: object) -> str:
+        captured["model"] = model
+        return "LOCAL_MODEL"
+
+    with _patch.object(model_utils, "init_chat_model", _fake_init):
+        model_utils.make_model(
+            "local:/mnt/D/models/Qwen3.8-27B", use_gateway=False, max_tokens=64_000
+        )
+
+    assert captured.get("model") == "/mnt/D/models/Qwen3.8-27B"
+    assert getattr(lo_base, "_open_swe_overflow_patched", False), (
+        "local: model build must install the overflow patch (early-return path)"
+    )
+    assert model_utils._local_overflow_installed
+
+
 def _build_overflowing_model(calls: list[str]) -> ChatOpenAI:
     """A profile-less ChatOpenAI that overflows on the first user-request call.
 
