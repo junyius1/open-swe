@@ -90,6 +90,7 @@ def test_local_model_build_installs_overflow_patch() -> None:
 
     def _fake_init(model: str, **kwargs: object) -> str:
         captured["model"] = model
+        captured["profile"] = kwargs.get("profile")
         return "LOCAL_MODEL"
 
     with _patch.object(model_utils, "init_chat_model", _fake_init):
@@ -98,6 +99,11 @@ def test_local_model_build_installs_overflow_patch() -> None:
         )
 
     assert captured.get("model") == "/mnt/D/models/Qwen3.8-27B"
+    # A local model must ship a profile so the summarization middleware uses
+    # fraction-based triggers instead of its fixed 170k-token fallback.
+    profile = captured.get("profile")
+    assert isinstance(profile, dict), "local models must be built with a profile"
+    assert profile.get("max_input_tokens") == 196_000
     assert getattr(lo_base, "_open_swe_overflow_patched", False), (
         "local: model build must install the overflow patch (early-return path)"
     )
@@ -116,10 +122,14 @@ def _build_overflowing_model(calls: list[str]) -> ChatOpenAI:
 
     class _OverflowingChatOpenAI(ChatOpenAI):
         async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-            first = messages[0] if messages else None
-            calls.append(json.dumps(first.content, ensure_ascii=False) if first is not None else "")
             from langchain_core.outputs import ChatGeneration, ChatResult
 
+            first = messages[0] if messages else None
+            first_text = json.dumps(first.content, ensure_ascii=False) if first is not None else ""
+            calls.append(first_text)
+            # Summary-generation calls (map or reduce rounds) carry the summary
+            # system prompt; the user request does not.
+            is_summary_call = "Context Extraction Assistant" in first_text
             if len(calls) == 1:
                 # The HTTP layer raised a raw BadRequestError; the real _agenerate routes
                 # it through _handle_openai_bad_request, which the patch turns into a
@@ -127,7 +137,7 @@ def _build_overflowing_model(calls: list[str]) -> ChatOpenAI:
                 from langchain_openai.chat_models import base as lo_base
 
                 lo_base._handle_openai_bad_request(_make_bad_request(VLLM_OVERFLOW_MESSAGE))
-            if len(calls) == 2:
+            if is_summary_call:
                 return ChatResult(
                     generations=[ChatGeneration(message=AIMessage(content=SUMMARY_TEXT))]
                 )
@@ -221,14 +231,22 @@ def test_summarization_middleware_retries_after_local_overflow() -> None:
         warnings.simplefilter("ignore")
         result = asyncio.run(mw.awrap_model_call(request, handler))
 
-    # 3 model calls total: (1) the overflowing user request, (2) the summary-generation
-    # call, (3) the summarized user-request retry. A raw BadRequestError would have left
-    # this at 1 call and raised.
-    assert len(calls) == 3, f"expected overflow + summary + retry, got {len(calls)} calls"
+    # Many model calls: (1) the overflowing user request, (2..n-1) summary-generation
+    # calls (one map round per 40k-token chunk, plus a reduce round when more than one
+    # chunk is produced), (n) the summarized user-request retry. A raw BadRequestError
+    # would have left this at 1 call and raised.
+    assert len(calls) >= 3, f"expected overflow + summary + retry, got {len(calls)} calls"
+    assert "Context Extraction Assistant" not in calls[0], (
+        "first call is the overflowing user request"
+    )
 
-    # The retry (call 3) must have started from the summary, not the original giant history.
-    assert SUMMARY_TEXT in calls[2], "retry must start from the summarization message"
-    assert "Task message 0" not in calls[2], "retry must not re-send the original history"
+    # The retry (last call) must have started from the summary, not the original giant history.
+    assert SUMMARY_TEXT in calls[-1], "retry must start from the summarization message"
+    assert "Task message 0" not in calls[-1], "retry must not re-send the original history"
+
+    # Every intermediate call is a bounded summary-generation call.
+    for call in calls[1:-1]:
+        assert "Context Extraction Assistant" in call, "intermediate calls must be summary calls"
 
     # The final model response is the successful retry.
     final = result.model_response.result[0]

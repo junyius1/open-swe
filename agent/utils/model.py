@@ -392,6 +392,14 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
         if extra_body:
             model_kwargs["extra_body"] = extra_body
 
+        # vLLM rejects input+max_tokens > --max-model-len, so the default sits
+        # below 262144 - 64000. With this profile the summarization middleware
+        # switches from its fixed 170k-token fallback to fraction-based
+        # triggers (85%/10%) sized to the real window.
+        model_kwargs["profile"] = {
+            "max_input_tokens": int(os.environ.get("LOCAL_LLM_MAX_INPUT_TOKENS", "196000"))
+        }
+
         install_local_reasoning_patch()
 
         local_model = init_chat_model(model=model_name, **model_kwargs)
