@@ -1,5 +1,6 @@
 import asyncio
 import os
+from collections.abc import Mapping
 from typing import Any, Literal, TypedDict, Unpack, cast
 
 from langchain.chat_models import init_chat_model
@@ -171,6 +172,163 @@ def install_context_overflow_error_patch() -> None:
     _local_overflow_installed = True
 
 
+_local_reasoning_installed = False
+
+# The base ``ChatOpenAI`` stamps ``model_provider="openai"`` on every
+# chat-completions chunk, which routes ``content_blocks`` to the OpenAI
+# translator — that translator (in both Python and the ``@langchain/core``
+# JS) understands the Responses-API reasoning shape but drops the
+# ``reasoning_content``/``reasoning`` fields that Qwen/vLLM/DashScope
+# actually emit.
+# ``"deepseek"`` is the one provider label that resolves to a
+# reasoning-content-aware path on both sides: Python has no ``deepseek``
+# translator (so ``content_blocks`` falls back to its built-in
+# ``additional_kwargs["reasoning_content"]`` extraction) and the JS side
+# registers a ``deepseek`` translator that reads ``reasoning_content``.
+_LOCAL_REASONING_MODEL_PROVIDER = "deepseek"
+_LOCAL_REASONING_MODEL_PROVIDER_KEY = "model_provider"
+_LOCAL_REASONING_MARKER = "_open_swe_local_reasoning"
+# OpenAI-compatible servers disagree on the thinking field name: Qwen /
+# DashScope (and some vLLM chat templates) emit ``reasoning_content``,
+# others emit plain ``reasoning``. Both carry the same thinking tokens.
+_LOCAL_REASONING_FIELD_KEYS = ("reasoning_content", "reasoning")
+
+
+def _delta_reasoning_text(chunk: Mapping[str, Any]) -> str | None:
+    """Extract the thinking slice from a chat-completions stream chunk's delta."""
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0]
+    if not isinstance(choice, Mapping):
+        return None
+    delta = choice.get("delta")
+    if not isinstance(delta, Mapping):
+        return None
+    return _first_reasoning_field(delta)
+
+
+def _message_reasoning_text(message: Any) -> str | None:
+    """Extract the thinking text from a non-streaming chat-completions message (dict or SDK object)."""
+    if not message:
+        return None
+    if isinstance(message, Mapping):
+        return _first_reasoning_field(message)
+    for key in _LOCAL_REASONING_FIELD_KEYS:
+        value = getattr(message, key, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _first_reasoning_field(mapping: Mapping[str, Any] | None) -> str | None:
+    if not mapping:
+        return None
+    for key in _LOCAL_REASONING_FIELD_KEYS:
+        value = mapping.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def install_local_reasoning_patch() -> None:
+    """Capture local-LLM ``reasoning_content`` so its thinking renders in the dashboard.
+
+    The base ``ChatOpenAI`` deliberately drops provider-specific fields such as
+    ``reasoning_content`` (documented at the top of its ``base.py``). For
+    ``local:`` models — Qwen/vLLM/DashScope — the thinking tokens are therefore
+    discarded before they reach ``AIMessageChunk.content_blocks``, so the v3
+    streaming bridge never emits ``reasoning-delta`` events and the dashboard
+    shows only tool calls plus the final answer.
+
+    The patch does two things for local-model chunks only (see
+    ``_LOCAL_REASONING_MARKER``):
+
+    * store each chunk's thinking slice (``delta.reasoning_content`` or
+      ``delta.reasoning``) in ``additional_kwargs["reasoning_content"]``; and
+    * relabel ``response_metadata["model_provider"]`` so ``content_blocks``
+      resolves to a reasoning-content-aware translator instead of the OpenAI one
+      that silently drops the field.
+
+    The same capture is applied to the non-streaming result path
+    (``_create_chat_result``): the agent factory invokes models via
+    ``ainvoke`` and the compat bridge reconstructs the ``message-start``
+    event — including its provider label and the ``additional_kwargs``
+    that carry the accumulated thinking — from the final message.
+
+    Everything downstream — the v3 ``reasoning-delta`` events, the client
+    ``MessageAssembler`` reasoning blocks, and the ``ReasoningBlock`` renderer —
+    already handles standard reasoning blocks, so this is the single missing
+    link. Mirrors what the DeepSeek partner does natively.
+    """
+    global _local_reasoning_installed
+    if _local_reasoning_installed:
+        return
+    try:
+        from langchain_openai.chat_models import base as lo_base
+    except ImportError:
+        return
+    if getattr(lo_base, "_open_swe_reasoning_patched", False):
+        _local_reasoning_installed = True
+        return
+
+    original_convert = lo_base.BaseChatOpenAI._convert_chunk_to_generation_chunk
+    original_result = lo_base.BaseChatOpenAI._create_chat_result
+
+    def _patched_convert(self: Any, chunk: Mapping[str, Any], *args: Any) -> Any:
+        generation_chunk = original_convert(self, chunk, *args)
+        if (
+            generation_chunk is None
+            or not isinstance(generation_chunk.message, lo_base.AIMessageChunk)
+            or not getattr(self, _LOCAL_REASONING_MARKER, False)
+        ):
+            return generation_chunk
+        message = generation_chunk.message
+        message.response_metadata[_LOCAL_REASONING_MODEL_PROVIDER_KEY] = (
+            _LOCAL_REASONING_MODEL_PROVIDER
+        )
+        if (reasoning := _delta_reasoning_text(chunk)) is not None:
+            message.additional_kwargs["reasoning_content"] = reasoning
+        return generation_chunk
+
+    def _patched_create_chat_result(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original_result(self, *args, **kwargs)
+        if not getattr(self, _LOCAL_REASONING_MARKER, False):
+            return result
+        response = args[0] if args else kwargs.get("response")
+        reasoning: str | None = None
+        model_name: str | None = None
+        choices: Any = None
+        if isinstance(response, Mapping):
+            choices = response.get("choices")
+            if (model := response.get("model")) is not None:
+                model_name = str(model)
+        else:
+            choices = getattr(response, "choices", None)
+            model_name = getattr(response, "model", None)
+        if isinstance(choices, list) and choices:
+            choice = choices[0]
+            if isinstance(choice, Mapping):
+                reasoning = _message_reasoning_text(choice.get("message"))
+            else:
+                reasoning = _message_reasoning_text(getattr(choice, "message", None))
+        for generation in result.generations:
+            message = generation.message
+            message.response_metadata[_LOCAL_REASONING_MODEL_PROVIDER_KEY] = (
+                _LOCAL_REASONING_MODEL_PROVIDER
+            )
+            if isinstance(model_name, str):
+                message.response_metadata.setdefault("model_name", model_name)
+            if reasoning is not None:
+                message.additional_kwargs["reasoning_content"] = reasoning
+        return result
+
+    lo_base.BaseChatOpenAI._convert_chunk_to_generation_chunk = _patched_convert  # type: ignore[method-assign]
+    lo_base.BaseChatOpenAI._create_chat_result = _patched_create_chat_result  # type: ignore[method-assign]
+    lo_base._open_swe_reasoning_patched = True
+    _local_reasoning_installed = True
+
+
 def _coerce_openai_chat_completions_kwargs(model_kwargs: dict[str, object]) -> None:
     if model_kwargs.get("use_responses_api") is not False:
         return
@@ -234,7 +392,18 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
         if extra_body:
             model_kwargs["extra_body"] = extra_body
 
-        return init_chat_model(model=model_name, **model_kwargs)
+        install_local_reasoning_patch()
+
+        local_model = init_chat_model(model=model_name, **model_kwargs)
+        # Mark the instance so the reasoning patch only relabels/captures
+        # chunks from local models, leaving other chat-completions models
+        # alone. Unsettable markers (test doubles, proxies) are harmless:
+        # the patch no-ops on instances that carry no marker.
+        try:
+            local_model._open_swe_local_reasoning = True  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass
+        return local_model
 
     if model_id.startswith("openai:"):
         model_kwargs["base_url"] = (
