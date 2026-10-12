@@ -3,6 +3,7 @@ import type {
   Project,
   QueuedThreadMessage,
 } from "@/features/agents/lib/types"
+import type { ConversationSummary } from "@/features/agents/lib/summaryEvent"
 
 export interface ApprovalCallbacks {
   onApprove?: (approvalRequestId: string) => void
@@ -38,4 +39,10 @@ export interface MessagesProps extends ApprovalCallbacks {
   scrollButtonSlot?: "internal" | "external"
   onShowScrollToBottomChange?: (show: boolean) => void
   scrollControlRef?: React.MutableRefObject<MessagesScrollControl | null>
+  /**
+   * Conversation-compaction summary from the private `_summarization_event`
+   * channel. When present, rendered once above the transcript as a
+   * collapsible "Summary" block (see `SummaryBlock`).
+   */
+  conversationSummary?: ConversationSummary | null
 }

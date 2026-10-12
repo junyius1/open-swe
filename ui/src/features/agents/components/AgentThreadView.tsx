@@ -23,6 +23,7 @@ import { Messages } from "@/features/agents/components/messages"
 import { OptimisticThreadHydrationRecovery } from "@/features/agents/components/OptimisticThreadHydrationRecovery"
 import { latestContextTokens } from "@/features/agents/lib/contextUsage"
 import { streamMessagesToUi } from "@/features/agents/lib/streamMessagesToUi"
+import { extractConversationSummary } from "@/features/agents/lib/summaryEvent"
 import { messageArrivalTimestamp } from "@/features/agents/lib/messageTimestamps"
 import { useSubmitAgentMessage } from "@/features/agents/lib/provider/useSubmitAgentMessage"
 import { useModelOptions } from "@/features/agents/lib/provider/useModelOptions"
@@ -156,6 +157,14 @@ export function AgentThreadView({
     )
   }, [stream.messages, stream.toolCalls, thread.messages])
 
+  // The summarization middleware stashes its compaction summary in the private
+  // `_summarization_event` channel, which leaks into the SDK's `values`
+  // snapshot. Surface it as a collapsible "Summary" block instead of a message.
+  const conversationSummary = useMemo(
+    () => extractConversationSummary(stream.values),
+    [stream.values]
+  )
+
   const isStreaming =
     thread.status === "running" ||
     stream.isLoading ||
@@ -273,6 +282,7 @@ export function AgentThreadView({
               isThinking={isThinking}
               settingUpSandbox={settingUpSandbox}
               contentWidthClass="max-w-3xl"
+              conversationSummary={conversationSummary}
             />
             <div className="shrink-0 px-4 pb-4">
               <div className="mx-auto w-full max-w-3xl min-w-0">

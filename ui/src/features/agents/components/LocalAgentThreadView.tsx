@@ -42,6 +42,7 @@ import {
   writeStoredPanelCollapsed,
 } from "@/features/agents/lib/gitPanelPreferences"
 import { streamMessagesToUi } from "@/features/agents/lib/streamMessagesToUi"
+import { extractConversationSummary } from "@/features/agents/lib/summaryEvent"
 import { messageArrivalTimestamp } from "@/features/agents/lib/messageTimestamps"
 import { useIsMobile } from "@/lib/useIsMobile"
 import { cn } from "@/lib/utils"
@@ -194,6 +195,14 @@ export function LocalAgentThreadView({ sessionId }: { sessionId: string }) {
       } satisfies Message,
     ]
   }, [sessionId, stream.messages, stream.toolCalls, thread])
+
+  // The summarization middleware stashes its compaction summary in the private
+  // `_summarization_event` channel, which leaks into the SDK's `values`
+  // snapshot. Surface it as a collapsible "Summary" block instead of a message.
+  const conversationSummary = useMemo(
+    () => extractConversationSummary(stream.values),
+    [stream.values]
+  )
 
   const rememberSelection = useCallback(
     async (model?: ModelSelection | null) => {
@@ -379,6 +388,7 @@ export function LocalAgentThreadView({ sessionId }: { sessionId: string }) {
             messages={messages}
             onOpenFile={handleOpenFile}
             streamIsLoading={stream.isLoading}
+            conversationSummary={conversationSummary}
           />
           <div className="shrink-0 px-4 pb-4">
             <div className="mx-auto w-full max-w-3xl min-w-0">
