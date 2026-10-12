@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import posixpath
+import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
@@ -2082,6 +2083,140 @@ async def _readable_thread_metadata(
     return metadata
 
 
+def _is_plain_ai_message(message: Any) -> bool:
+    """True when the message is an AI turn carrying no tool calls.
+
+    A checkpoint written "as model" re-evaluates the model-to-tools edge, which
+    routes to END only when the last AI message has no tool calls; a tail that
+    ends anywhere else would leave a non-terminal checkpoint.
+    """
+    if not isinstance(message, dict) or message.get("type") != "ai":
+        return False
+    if message.get("tool_calls"):
+        return False
+    for block in message.get("content") or []:
+        if isinstance(block, dict) and block.get("type") in {"tool_call", "tool_use"}:
+            return False
+    return True
+
+
+_REPAIR_MAX_MISSING = 500
+_REPAIR_CHUNK_SIZE = 10
+_REPAIR_THROTTLE_SECONDS = 30.0
+_checkpoint_repair_attempts: dict[str, float] = {}
+
+
+async def _repair_truncated_thread_checkpoint(
+    client: Any,
+    thread_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Reconcile a truncated idle checkpoint against the in-memory thread record.
+
+    The in-memory dev checkpointer can lose a run's final write (process killed
+    or restarted while the last superstep was in flight), leaving the latest
+    checkpoint mid-loop: a dangling tool result, non-empty `next`/`tasks`, and a
+    transcript that ends before the thread's real tail. The thread record's own
+    `values.messages` still holds the full sequence. When the checkpoint is a
+    strict in-order prefix of that record and the missing tail ends in a plain
+    AI message, append the tail (chunked, verified) so the endpoint can serve a
+    complete transcript. Best effort: on any anomaly the original state is
+    returned untouched and the thread is throttled before another attempt. The
+    append is a plain state update (no pinned as_node), which is the reliable
+    path on the in-memory dev checkpointer.
+    """
+
+    def _now() -> float:
+        return time.monotonic()
+
+    if _now() - _checkpoint_repair_attempts.get(thread_id, 0.0) < _REPAIR_THROTTLE_SECONDS:
+        return result
+    checkpoint_messages = (result.get("values") or {}).get("messages")
+    if not isinstance(checkpoint_messages, list) or not checkpoint_messages:
+        return result
+
+    try:
+        record = await client.threads.get(thread_id)
+    except Exception:
+        logger.warning("Checkpoint repair: could not read thread record %s", thread_id, exc_info=True)
+        _checkpoint_repair_attempts[thread_id] = _now()
+        return result
+    mirror = (record.get("values") or {}).get("messages") if isinstance(record, dict) else None
+    if not isinstance(mirror, list) or not mirror:
+        return result
+
+    checkpoint_ids = [m.get("id") for m in checkpoint_messages if isinstance(m, dict)]
+    mirror_ids = [m.get("id") for m in mirror if isinstance(m, dict)]
+    if not checkpoint_ids or len(mirror_ids) <= len(checkpoint_ids):
+        return result
+    checkpoint_set = set(checkpoint_ids)
+    missing = [m for m in mirror if isinstance(m, dict) and m.get("id") not in checkpoint_set]
+    # Strict in-order prefix: the checkpoint must be exactly the head of the record.
+    if [m.get("id") for m in mirror if isinstance(m, dict) and m.get("id") in checkpoint_set] != checkpoint_ids:
+        return result
+    if not missing or len(missing) > _REPAIR_MAX_MISSING:
+        return result
+    if not _is_plain_ai_message(missing[-1]):
+        return result
+
+    logger.info(
+        "Checkpoint repair: thread %s checkpoint holds %d of %d messages; appending %d",
+        thread_id,
+        len(checkpoint_ids),
+        len(mirror_ids),
+        len(missing),
+    )
+    expected = len(checkpoint_ids)
+    for start in range(0, len(missing), _REPAIR_CHUNK_SIZE):
+        chunk = missing[start : start + _REPAIR_CHUNK_SIZE]
+        expected += len(chunk)
+        try:
+            # Append as a plain state update. Do NOT pin ``as_node="model"``:
+            # on this runtime that path re-evaluates the model->tools edge and
+            # intermittently 500s (small tails) or no-ops (large tails), while
+            # the inferred-node path applies the same tail reliably. The tail
+            # already ends on a plain AI message (guarded above), so the
+            # inferred node still routes to END and the result is terminal.
+            await client.threads.update_state(thread_id, {"messages": chunk})
+            current = await client.threads.get_state(thread_id)
+            current_count = len(
+                (current.get("values") or {}).get("messages") or []
+            ) if isinstance(current, dict) else -1
+        except Exception:
+            logger.warning("Checkpoint repair: append failed for %s", thread_id, exc_info=True)
+            _checkpoint_repair_attempts[thread_id] = _now()
+            return result
+        if current_count != expected:
+            logger.warning(
+                "Checkpoint repair: append not applied for %s (expected %d messages, got %d); aborting",
+                thread_id,
+                expected,
+                current_count,
+            )
+            _checkpoint_repair_attempts[thread_id] = _now()
+            return result
+    try:
+        repaired = await client.threads.get_state(thread_id)
+    except Exception:
+        logger.warning("Checkpoint repair: re-read failed for %s", thread_id, exc_info=True)
+        _checkpoint_repair_attempts[thread_id] = _now()
+        return result
+    if not isinstance(repaired, dict):
+        return result
+    repaired_values = as_json_object(repaired)
+    _checkpoint_repair_attempts[thread_id] = _now()
+    repaired_ids = [
+        m.get("id")
+        for m in (repaired_values.get("values") or {}).get("messages") or []
+        if isinstance(m, dict)
+    ]
+    if not repaired_values.get("next") and repaired_ids == mirror_ids:
+        logger.info("Checkpoint repair: thread %s now holds all %d messages", thread_id, len(mirror_ids))
+        return repaired_values
+    logger.warning("Checkpoint repair: thread %s still incomplete after append; serving original state", thread_id)
+    return result
+
+
 async def get_dashboard_thread_state(
     thread_id: str,
     login: str,
@@ -2105,6 +2240,18 @@ async def get_dashboard_thread_state(
     with phase(record, "get_state"):
         state = await client.threads.get_state(thread_id)
     result = as_json_object(state)
+    # A killed or restarted dev process can leave the latest checkpoint
+    # mid-loop (final write lost). Reconcile idle threads against the
+    # thread record's fuller message list before serving them.
+    if (
+        not _thread_is_busy(thread)
+        and latest_run_status not in {"pending", "running"}
+        and (result.get("next") or result.get("tasks"))
+    ):
+        try:
+            result = await _repair_truncated_thread_checkpoint(client, thread_id, result)
+        except Exception:
+            logger.warning("Checkpoint repair check failed for %s", thread_id, exc_info=True)
     # The SDK's `useStream` opens its live event subscription only when the
     # hydrated `getState()` looks active (`next` non-empty / absent). When a
     # run was just started out-of-band (our REST run-create), the latest
