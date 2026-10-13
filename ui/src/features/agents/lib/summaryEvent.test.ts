@@ -37,7 +37,8 @@ describe("extractConversationSummary", () => {
         file_path: "/conversation_history/session_abc.md",
         summary_message: {
           type: "human",
-          content: "You are in the middle of a conversation...\n\n<summary>...</summary>",
+          content:
+            "You are in the middle of a conversation...\n\n<summary>...</summary>",
         },
       },
     })

@@ -9,9 +9,9 @@ from typing import Any
 from urllib.parse import urlencode, urlparse
 
 import httpx
-from ..utils.thread_ops import langgraph_client
 
 from ..encryption import decrypt_token, encrypt_token
+from ..utils.thread_ops import langgraph_client
 
 NOTION_MCP_URL = "https://mcp.notion.com/mcp"
 NOTION_STATE_COOKIE_NAME = "osw_notion_oauth_state"

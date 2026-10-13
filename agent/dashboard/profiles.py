@@ -16,10 +16,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from ..utils.thread_ops import langgraph_client
 from pydantic import BaseModel, model_validator
 
 from ..encryption import decrypt_token, encrypt_token
+from ..utils.thread_ops import langgraph_client
 from .oauth import (
     expires_at_from_github_response,
     is_unrecoverable_refresh_error,

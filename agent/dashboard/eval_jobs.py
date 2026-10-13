@@ -13,8 +13,6 @@ import os
 from datetime import UTC, datetime
 from typing import Any, Literal, TypedDict
 
-from ..utils.thread_ops import langgraph_client
-
 from agent.review.eval_store import (
     _HEARTBEAT_STALE_SECONDS,
     DEFAULT_EVAL_PROJECT,
@@ -22,6 +20,8 @@ from agent.review.eval_store import (
     REVIEWER_EVAL_KEY,
 )
 from agent.review.findings import REVIEW_FINDING_CAP
+
+from ..utils.thread_ops import langgraph_client
 
 logger = logging.getLogger(__name__)
 

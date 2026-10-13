@@ -33,7 +33,7 @@ export function SummaryBlock({ summary }: { summary: ConversationSummary }) {
         <div className="ms-1 mt-1 border-s border-border/45 ps-3 text-[13px] leading-5 text-muted-foreground">
           <Markdown content={summary.text} />
           {summary.filePath && (
-            <div className="mt-2 flex items-center gap-1.5 break-all text-xs text-muted-foreground/80">
+            <div className="mt-2 flex items-center gap-1.5 text-xs break-all text-muted-foreground/80">
               <FileText className="size-3 shrink-0" aria-hidden />
               <span>Full history: {summary.filePath}</span>
             </div>

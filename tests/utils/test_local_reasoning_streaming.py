@@ -17,7 +17,7 @@ resolves to a reasoning-content-aware translator on both the Python and the
 ``@langchain/core`` JS sides.
 """
 
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -86,7 +86,7 @@ def test_streaming_chunk_carries_reasoning_block() -> None:
     message = generation.message
     assert message.response_metadata["model_provider"] == "deepseek"
     assert message.additional_kwargs["reasoning_content"] == "思考中"
-    blocks = message.content_blocks
+    blocks = cast("list[dict[str, Any]]", message.content_blocks)
     assert [block["type"] for block in blocks] == ["reasoning"]
     assert blocks[0]["reasoning"] == "思考中"
 
@@ -94,12 +94,14 @@ def test_streaming_chunk_carries_reasoning_block() -> None:
     generation = lo_base.BaseChatOpenAI._convert_chunk_to_generation_chunk(
         model, _stream_chunk({"reasoning_content": "继续思考"}), AIMessageChunk, None
     )
+    assert generation is not None
     assert generation.message.additional_kwargs["reasoning_content"] == "继续思考"
 
     # text chunks are left alone (no reasoning key, provider still relabeled)
     generation = lo_base.BaseChatOpenAI._convert_chunk_to_generation_chunk(
         model, _stream_chunk({"content": "答案"}), AIMessageChunk, None
     )
+    assert generation is not None
     assert "reasoning_content" not in generation.message.additional_kwargs
     assert generation.message.response_metadata["model_provider"] == "deepseek"
 
@@ -109,6 +111,7 @@ def test_streaming_chunk_carries_reasoning_block() -> None:
     generation = lo_base.BaseChatOpenAI._convert_chunk_to_generation_chunk(
         plain, _stream_chunk({"reasoning": "别动我"}), AIMessageChunk, None
     )
+    assert generation is not None
     assert generation.message.response_metadata["model_provider"] == "openai"
     assert "reasoning_content" not in generation.message.additional_kwargs
 
@@ -122,10 +125,12 @@ def test_streaming_reasoning_chunks_accumulate() -> None:
 
     aggregated: AIMessageChunk | None = None
     for delta in ({"reasoning": "用"}, {"reasoning": "中文"}, {"content": "8"}):
-        chunk = convert(model, _stream_chunk(delta), AIMessageChunk, None).message
+        generated = convert(model, _stream_chunk(delta), AIMessageChunk, None)
+        assert generated is not None
+        chunk = cast("AIMessageChunk", generated.message)
         aggregated = chunk if aggregated is None else aggregated + chunk
     assert aggregated is not None
-    blocks = aggregated.content_blocks
+    blocks = cast("list[dict[str, Any]]", aggregated.content_blocks)
     reasoning = [block for block in blocks if block["type"] == "reasoning"]
     assert [block["reasoning"] for block in reasoning] == ["用中文"]
     assert aggregated.text == "8"

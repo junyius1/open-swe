@@ -8,8 +8,9 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from ..utils.thread_ops import langgraph_client
 from pydantic import BaseModel, Field, field_validator
+
+from ..utils.thread_ops import langgraph_client
 
 logger = logging.getLogger(__name__)
 

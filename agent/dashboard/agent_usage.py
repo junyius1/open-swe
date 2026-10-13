@@ -11,9 +11,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import httpx
-from ..utils.thread_ops import langgraph_client
 
 from ..utils.json_types import as_json_object, thread_metadata
+from ..utils.thread_ops import langgraph_client
 
 AGENT_RUN_NAMESPACE = ["usage", "v2", "agent_runs"]
 AGENT_PR_NAMESPACE = ["usage", "v2", "agent_prs"]

@@ -8,8 +8,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException
-from ..utils.thread_ops import langgraph_client
 from pydantic import BaseModel, Field, field_validator
+
+from ..utils.thread_ops import langgraph_client
 
 SKILLS_NAMESPACE = "user_skills"
 ORGANIZATION_SKILLS_NAMESPACE = "organization_skills"

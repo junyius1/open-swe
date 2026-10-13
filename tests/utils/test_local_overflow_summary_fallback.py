@@ -24,6 +24,7 @@ from langchain_core.exceptions import ContextOverflowError
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from openai import BadRequestError
+from pydantic import SecretStr
 
 from agent.utils import model as model_utils
 
@@ -144,7 +145,7 @@ def _build_overflowing_model(calls: list[str]) -> ChatOpenAI:
             return ChatResult(generations=[ChatGeneration(message=AIMessage(content=FINAL_TEXT))])
 
     return _OverflowingChatOpenAI(
-        model="local-model", base_url="http://localhost:1/v1", api_key="dummy", max_tokens=64_000
+        model="local-model", base_url="http://localhost:1/v1", api_key=SecretStr("dummy")
     )
 
 
@@ -210,7 +211,11 @@ def test_summarization_middleware_retries_after_local_overflow() -> None:
 
     from deepagents.backends import StateBackend
     from deepagents.middleware.summarization import create_summarization_middleware
-    from langchain.agents.middleware.types import ModelRequest, ModelResponse
+    from langchain.agents.middleware.types import (
+        ExtendedModelResponse,
+        ModelRequest,
+        ModelResponse,
+    )
 
     messages = _to_langchain(_load_state_messages())
     calls: list[str] = []
@@ -230,6 +235,9 @@ def test_summarization_middleware_retries_after_local_overflow() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         result = asyncio.run(mw.awrap_model_call(request, handler))
+    assert isinstance(result, ExtendedModelResponse), (
+        "overflow-retry must return an ExtendedModelResponse carrying the summarization event"
+    )
 
     # Many model calls: (1) the overflowing user request, (2..n-1) summary-generation
     # calls (one map round per 40k-token chunk, plus a reduce round when more than one
@@ -253,7 +261,10 @@ def test_summarization_middleware_retries_after_local_overflow() -> None:
     assert final.content == FINAL_TEXT, "final response must be the successful summarized retry"
 
     # The summarization event is persisted so later turns keep the compacted history.
-    update = result.command.update
+    command = result.command
+    assert command is not None, "overflow-retry must persist state via a command"
+    update = command.update
+    assert update is not None
     assert "_summarization_event" in update, "summarization event must be persisted"
     event = update["_summarization_event"]
     assert event["cutoff_index"] > 0, "summarization must evict at least some messages"

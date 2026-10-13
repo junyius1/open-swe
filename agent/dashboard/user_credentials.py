@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ..utils.thread_ops import langgraph_client
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from ..encryption import decrypt_token, encrypt_token
+from ..utils.thread_ops import langgraph_client
 from .notion_oauth import is_reauth_required_error, refresh_notion_access_token
 from .team_credentials import DEFAULT_LANGSMITH_ENDPOINT, LangSmithCredentials
 

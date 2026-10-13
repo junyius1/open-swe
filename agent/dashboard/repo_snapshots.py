@@ -18,9 +18,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from ..utils.thread_ops import langgraph_client
 from pydantic import BaseModel, Field, field_validator
 
+from ..utils.thread_ops import langgraph_client
 from .review_styles import normalize_repo_full_name
 
 logger = logging.getLogger(__name__)

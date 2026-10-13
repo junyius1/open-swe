@@ -10,7 +10,6 @@ import logging
 from datetime import UTC, datetime
 
 from ..utils.thread_ops import langgraph_client
-
 from .review_styles import normalize_repo_full_name
 
 logger = logging.getLogger(__name__)

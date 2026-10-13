@@ -138,6 +138,7 @@ def install_context_overflow_error_patch() -> None:
         from langchain_openai.chat_models import base as lo_base
     except ImportError:
         return
+    lo_base = cast("Any", lo_base)
     if getattr(lo_base, "_open_swe_overflow_patched", False):
         _local_overflow_installed = True
         return
@@ -268,6 +269,7 @@ def install_local_reasoning_patch() -> None:
         from langchain_openai.chat_models import base as lo_base
     except ImportError:
         return
+    lo_base = cast("Any", lo_base)
     if getattr(lo_base, "_open_swe_reasoning_patched", False):
         _local_reasoning_installed = True
         return
@@ -275,7 +277,7 @@ def install_local_reasoning_patch() -> None:
     original_convert = lo_base.BaseChatOpenAI._convert_chunk_to_generation_chunk
     original_result = lo_base.BaseChatOpenAI._create_chat_result
 
-    def _patched_convert(self: Any, chunk: Mapping[str, Any], *args: Any) -> Any:
+    def _patched_convert(self: Any, chunk: dict[str, Any], *args: Any) -> Any:
         generation_chunk = original_convert(self, chunk, *args)
         if (
             generation_chunk is None
@@ -378,7 +380,9 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
         model_kwargs.pop("effort", None)
 
         # 👈 【新增以下逻辑】：注入 Qwen/DashScope/vLLM 的思考开关
-        extra_body = dict(model_kwargs.get("extra_body") or {})
+        extra_body: dict[str, Any] = dict(
+            cast("Mapping[str, Any]", model_kwargs.get("extra_body") or {})
+        )
         # 从环境变量或者默认开启思考模式
         enable_thinking = os.environ.get("LOCAL_LLM_ENABLE_THINKING", "true").lower() in (
             "true",
@@ -402,7 +406,7 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
 
         install_local_reasoning_patch()
 
-        local_model = init_chat_model(model=model_name, **model_kwargs)
+        local_model = init_chat_model(model=model_name, **cast("dict[str, Any]", model_kwargs))
         # Mark the instance so the reasoning patch only relabels/captures
         # chunks from local models, leaving other chat-completions models
         # alone. Unsettable markers (test doubles, proxies) are harmless:

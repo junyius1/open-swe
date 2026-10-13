@@ -2138,7 +2138,9 @@ async def _repair_truncated_thread_checkpoint(
     try:
         record = await client.threads.get(thread_id)
     except Exception:
-        logger.warning("Checkpoint repair: could not read thread record %s", thread_id, exc_info=True)
+        logger.warning(
+            "Checkpoint repair: could not read thread record %s", thread_id, exc_info=True
+        )
         _checkpoint_repair_attempts[thread_id] = _now()
         return result
     mirror = (record.get("values") or {}).get("messages") if isinstance(record, dict) else None
@@ -2152,7 +2154,9 @@ async def _repair_truncated_thread_checkpoint(
     checkpoint_set = set(checkpoint_ids)
     missing = [m for m in mirror if isinstance(m, dict) and m.get("id") not in checkpoint_set]
     # Strict in-order prefix: the checkpoint must be exactly the head of the record.
-    if [m.get("id") for m in mirror if isinstance(m, dict) and m.get("id") in checkpoint_set] != checkpoint_ids:
+    if [
+        m.get("id") for m in mirror if isinstance(m, dict) and m.get("id") in checkpoint_set
+    ] != checkpoint_ids:
         return result
     if not missing or len(missing) > _REPAIR_MAX_MISSING:
         return result
@@ -2179,9 +2183,11 @@ async def _repair_truncated_thread_checkpoint(
             # inferred node still routes to END and the result is terminal.
             await client.threads.update_state(thread_id, {"messages": chunk})
             current = await client.threads.get_state(thread_id)
-            current_count = len(
-                (current.get("values") or {}).get("messages") or []
-            ) if isinstance(current, dict) else -1
+            current_count = (
+                len((current.get("values") or {}).get("messages") or [])
+                if isinstance(current, dict)
+                else -1
+            )
         except Exception:
             logger.warning("Checkpoint repair: append failed for %s", thread_id, exc_info=True)
             _checkpoint_repair_attempts[thread_id] = _now()
@@ -2211,9 +2217,14 @@ async def _repair_truncated_thread_checkpoint(
         if isinstance(m, dict)
     ]
     if not repaired_values.get("next") and repaired_ids == mirror_ids:
-        logger.info("Checkpoint repair: thread %s now holds all %d messages", thread_id, len(mirror_ids))
+        logger.info(
+            "Checkpoint repair: thread %s now holds all %d messages", thread_id, len(mirror_ids)
+        )
         return repaired_values
-    logger.warning("Checkpoint repair: thread %s still incomplete after append; serving original state", thread_id)
+    logger.warning(
+        "Checkpoint repair: thread %s still incomplete after append; serving original state",
+        thread_id,
+    )
     return result
 
 
