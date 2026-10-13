@@ -42,6 +42,13 @@ try:
 except Exception:
     pass
 
+# 修复 langgraph_runtime_inmem 的 cron end_time 类型问题：API 把 ISO 字符串
+# 原样存入内存 store，调度器每次比较 end_time < now 都会抛 TypeError，
+# 导致所有 cron 永远无法触发。
+from agent.utils.cron_endtime_patch import install_cron_end_time_patch
+
+install_cron_end_time_patch()
+
 from langgraph.graph.state import RunnableConfig
 from langgraph.pregel import Pregel
 from langgraph.runtime import Runtime
