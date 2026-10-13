@@ -5,7 +5,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from langgraph_sdk import get_client
+from ..utils.thread_ops import langgraph_client
 from langgraph_sdk.schema import Run
 from pydantic import BaseModel
 
@@ -60,7 +60,7 @@ class PlanRejection(BaseModel):
 
 
 async def _thread_metadata(thread_id: str) -> dict[str, Any]:
-    client = get_client()
+    client = langgraph_client()
     try:
         thread = await client.threads.get(thread_id)
     except Exception as exc:  # noqa: BLE001
