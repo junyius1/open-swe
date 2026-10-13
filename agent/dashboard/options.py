@@ -223,8 +223,7 @@ def gate_fable_model(
     return model_id, effort
 
 
-# DEFAULT_MODEL_ID: str = "openai:gpt-5.6-sol"
-DEFAULT_MODEL_ID: str = "local:/mnt/D/models/Qwen3.8-27B"
+DEFAULT_MODEL_ID: str = "openai:gpt-5.6-sol"
 DEFAULT_MODEL_EFFORT: str = "medium"
 
 
