@@ -1,5 +1,8 @@
 import asyncio
+import json
+import logging
 import os
+import urllib.request
 from collections.abc import Mapping
 from typing import Any, Literal, TypedDict, Unpack, cast
 
@@ -8,6 +11,8 @@ from langchain.chat_models import init_chat_model
 from ..dashboard.options import DEFAULT_MODEL_ID, model_profile_with_context_override
 from .gateway import gateway_env_default, gateway_overrides
 from .openai_oauth import build_desktop_openai_oauth_model, desktop_openai_oauth_available
+
+logger = logging.getLogger(__name__)
 
 OPENAI_RESPONSES_WS_BASE_URL = "wss://api.openai.com/v1"
 
@@ -124,6 +129,84 @@ def _is_context_overflow_error(e: BaseException) -> bool:
     if any(pattern in text for pattern in _LOCAL_OVERFLOW_PATTERNS):
         return True
     return "input_tokens" in text and "context" in text
+
+
+_LOCAL_LLM_WINDOW_CACHE: dict[tuple[str, str, int], int] = {}
+
+
+def _local_llm_max_input_tokens(
+    base_url: str, model_name: str, max_output_tokens: int | None
+) -> int | None:
+    """Resolve the effective input window of a ``local:`` (vLLM/OpenAI-compatible) model.
+
+    Precedence: the ``LOCAL_LLM_MAX_INPUT_TOKENS`` env override (verbatim),
+    then the serving stack's ``max_model_len`` from ``GET {base_url}/models``
+    minus the output budget. The profile value feeds
+    ``model.profile["max_input_tokens"]``, which the deepagents summarization
+    middleware multiplies by its 0.85 trigger fraction; without a profile that
+    proactive trigger is inert and runs only survive the reactive
+    overflow-retry fallback after vLLM rejects the call. Successful endpoint
+    reads are memoized per (base_url, model, output budget) for the process
+    lifetime: vLLM fixes max_model_len at startup, so re-reading is only
+    useful while the server is still up at build time.
+    """
+    cache_key = (base_url, model_name, max_output_tokens or 0)
+    cached = _LOCAL_LLM_WINDOW_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    override = os.environ.get("LOCAL_LLM_MAX_INPUT_TOKENS", "").strip()
+    if override:
+        try:
+            value = int(override)
+        except ValueError:
+            logger.warning("Ignoring invalid LOCAL_LLM_MAX_INPUT_TOKENS: %r", override)
+        else:
+            return value if value > 0 else None
+    try:
+        request = urllib.request.Request(f"{base_url.rstrip('/')}/models")
+        with urllib.request.urlopen(request, timeout=3) as response:
+            data = json.loads(response.read())
+    except Exception:
+        logger.warning(
+            "Local model profile: could not read %s/models; falling back to overflow-retry only",
+            base_url,
+            exc_info=True,
+        )
+        return None
+    for entry in (data or {}).get("data") or []:
+        if not isinstance(entry, dict) or entry.get("id") not in (
+            model_name,
+            model_name.lstrip("/"),
+        ):
+            continue
+        try:
+            window = int(entry.get("max_model_len") or 0)
+        except (TypeError, ValueError):
+            return None
+        if window <= 0:
+            return None
+        # max_model_len spans input + output; the profile must reflect input
+        # headroom only, or the 0.85 trigger fires after the window fills.
+        out = max_output_tokens if type(max_output_tokens) is int and max_output_tokens > 0 else 0
+        resolved = max(1, window - out)
+        _LOCAL_LLM_WINDOW_CACHE[cache_key] = resolved
+        return resolved
+    return None
+
+
+def _local_llm_model_profile(
+    model_name: str, base_url: str, max_output_tokens: int | None
+) -> dict[str, object]:
+    """Profile dict for a local model; empty (inert) when the window is unknown."""
+    max_input_tokens = _local_llm_max_input_tokens(base_url, model_name, max_output_tokens)
+    if max_input_tokens is None:
+        return {}
+    return {
+        "name": model_name,
+        "open_weights": True,
+        "tool_calling": True,
+        "max_input_tokens": max_input_tokens,
+    }
 
 
 def install_context_overflow_error_patch() -> None:
@@ -394,6 +477,11 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
 
         install_local_reasoning_patch()
 
+        local_profile = _local_llm_model_profile(
+            model_name, model_kwargs["base_url"], model_kwargs.get("max_tokens")
+        )
+        if local_profile:
+            model_kwargs["profile"] = local_profile
         local_model = init_chat_model(model=model_name, **model_kwargs)
         # Mark the instance so the reasoning patch only relabels/captures
         # chunks from local models, leaving other chat-completions models
