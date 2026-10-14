@@ -84,6 +84,10 @@ _SUPPORTED_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif",
 _MAX_DASHBOARD_IMAGES = 5
 _MAX_DASHBOARD_IMAGE_BYTES = 10 * 1024 * 1024
 _PROXY_REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+# History walks and deserializes every checkpoint of the thread; in the inmem
+# dev runtime that comes off multi-GB pickle shards, so full-history fetches
+# can exceed the generic 30s read budget.
+_HISTORY_PROXY_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
 _DISCOVERY_HISTORY_LIMIT = 5
 _PROXY_STREAM_TIMEOUT = httpx.Timeout(None)
 _THREAD_POST_COMMAND_METHODS = frozenset(
@@ -2841,8 +2845,17 @@ async def proxy_dashboard_thread_history(
         payload["limit"] = min(limit, _DISCOVERY_HISTORY_LIMIT)
     url = f"{langgraph_url().rstrip('/')}/threads/{thread_id}/history"
     headers = _langgraph_proxy_headers(content_type=content_type)
-    async with httpx.AsyncClient(timeout=_PROXY_REQUEST_TIMEOUT) as client:
-        response = await client.post(url, json=payload, headers=headers)
+    try:
+        async with httpx.AsyncClient(timeout=_HISTORY_PROXY_TIMEOUT) as client:
+            response = await client.post(url, json=payload, headers=headers)
+    except httpx.TimeoutException as exc:
+        logger.warning(
+            "History proxy timed out for thread %s (limit=%r)", thread_id, payload.get("limit")
+        )
+        raise HTTPException(503, "thread history request timed out; retry") from exc
+    except httpx.HTTPError as exc:
+        logger.warning("History proxy could not reach the LangGraph runtime", exc_info=True)
+        raise HTTPException(502, "could not reach the LangGraph runtime") from exc
     media_type = response.headers.get("content-type")
     return response.status_code, response.content, media_type
 

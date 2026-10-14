@@ -5,6 +5,7 @@ from typing import cast
 from unittest.mock import AsyncMock, patch
 from xml.etree import ElementTree
 
+import httpx
 import pytest
 from fastapi import HTTPException
 
@@ -1306,6 +1307,58 @@ async def test_read_endpoints_accessible_by_non_owner(monkeypatch) -> None:
     with pytest.raises(HTTPException) as exc_info:
         await thread_api.proxy_dashboard_thread_history("tid", "teammate", b"\xff")
     assert exc_info.value.status_code == 400
+
+
+async def test_history_proxy_maps_upstream_errors_to_http(monkeypatch) -> None:
+    """Upstream history failures must surface as clean HTTP errors, not 500s."""
+
+    class FakeThreads:
+        async def get(self, thread_id: str) -> dict[str, object]:
+            return {
+                "thread_id": "tid",
+                "metadata": {"source": "slack", "github_login": "owner"},
+            }
+
+    class FakeClient:
+        threads = FakeThreads()
+
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: FakeClient())
+
+    seen_timeouts: list[httpx.Timeout] = []
+
+    def make_client(error: Exception):
+        class FailingAsyncClient:
+            def __init__(self, *a: object, **kw: object) -> None:
+                seen_timeouts.append(kw["timeout"])
+
+            async def __aenter__(self) -> "FailingAsyncClient":
+                return self
+
+            async def __aexit__(self, *a: object) -> None:
+                pass
+
+            async def post(self, *a: object, **kw: object) -> None:
+                raise error
+
+        return FailingAsyncClient
+
+    # A slow inmem runtime (large checkpoint shards) must not 500 the dashboard,
+    # and history must get the longer read budget instead of the 30s default.
+    monkeypatch.setattr(
+        thread_api.httpx, "AsyncClient", make_client(httpx.ReadTimeout("read timed out"))
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 1000}')
+    assert exc_info.value.status_code == 503
+    assert seen_timeouts == [thread_api._HISTORY_PROXY_TIMEOUT]
+
+    # Any other transport failure is an upstream 502, not an unhandled 500.
+    monkeypatch.setattr(
+        thread_api.httpx, "AsyncClient", make_client(httpx.ConnectError("connection refused"))
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 5}')
+    assert exc_info.value.status_code == 502
 
 
 async def test_thread_state_uses_current_run_status_when_checkpoint_is_stale(monkeypatch) -> None:
