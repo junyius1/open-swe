@@ -5,12 +5,12 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from ..utils.thread_ops import langgraph_client
 from langgraph_sdk.schema import Run
 from pydantic import BaseModel
 
 from ..dispatch import dispatch_agent_run
 from ..utils.slack import post_slack_thread_reply
+from ..utils.thread_ops import langgraph_client
 from .oauth import require_same_origin_for_mutations, require_session
 from .plan_store import (
     PLAN_STATUS_APPROVED,
