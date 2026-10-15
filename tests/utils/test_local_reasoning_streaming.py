@@ -198,7 +198,7 @@ def test_non_streaming_result_carries_reasoning_block() -> None:
     assert "reasoning_content" not in result.generations[0].message.additional_kwargs
 
 
-def test_make_model_local_model_is_marked() -> None:
+async def test_make_model_local_model_is_marked() -> None:
     _install_fresh()
     from langchain_openai.chat_models import base as lo_base
 
@@ -215,7 +215,7 @@ def test_make_model_local_model_is_marked() -> None:
     try:
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.delenv("LOCAL_LLM_ENABLE_THINKING", raising=False)
-            model_utils.make_model("local:/mnt/D/models/Qwen3.8-27B", use_gateway=False)
+            await model_utils.make_model("local:/mnt/D/models/Qwen3.8-27B", use_gateway=False)
     finally:
         model_utils.init_chat_model = original
 

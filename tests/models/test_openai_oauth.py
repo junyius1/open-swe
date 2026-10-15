@@ -41,7 +41,9 @@ def _configure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPEN_SWE_OPENAI_OAUTH_BROKER_TOKEN", "broker-secret")
 
 
-def test_oauth_model_uses_dedicated_account_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_oauth_model_uses_dedicated_account_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _configure(monkeypatch)
     captured: dict[str, Any] = {}
 
@@ -54,7 +56,7 @@ def test_oauth_model_uses_dedicated_account_transport(monkeypatch: pytest.Monkey
         patch.object(model, "build_desktop_openai_oauth_model", fake_model),
         detect_blocking_calls(),
     ):
-        result = model.make_model("openai:gpt-5.6-sol", use_gateway=False, max_tokens=123)
+        result = await model.make_model("openai:gpt-5.6-sol", use_gateway=False, max_tokens=123)
 
     assert result == "MODEL"
     assert captured["model_name"] == "gpt-5.6-sol"

@@ -66,7 +66,7 @@ def test_unrelated_bad_request_is_not_reclassified() -> None:
         )
 
 
-def test_local_model_build_installs_overflow_patch() -> None:
+async def test_local_model_build_installs_overflow_patch() -> None:
     """The local: branch of make_model returns early, before the shared tail.
 
     This is the exact regression from the reported bug: the install was placed at the
@@ -93,7 +93,7 @@ def test_local_model_build_installs_overflow_patch() -> None:
         return "LOCAL_MODEL"
 
     with _patch.object(model_utils, "init_chat_model", _fake_init):
-        model_utils.make_model(
+        await model_utils.make_model(
             "local:/mnt/D/models/Qwen3.8-27B", use_gateway=False, max_tokens=64_000
         )
 

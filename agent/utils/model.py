@@ -1,12 +1,12 @@
 import asyncio
-import json
 import logging
 import os
-import urllib.request
 from collections.abc import Mapping
 from typing import Any, Literal, TypedDict, Unpack, cast
 
+import httpx
 from langchain.chat_models import init_chat_model
+from langchain_core.language_models import BaseChatModel
 
 from ..dashboard.options import DEFAULT_MODEL_ID, model_profile_with_context_override
 from .gateway import gateway_env_default, gateway_overrides
@@ -134,7 +134,7 @@ def _is_context_overflow_error(e: BaseException) -> bool:
 _LOCAL_LLM_WINDOW_CACHE: dict[tuple[str, str, int], int] = {}
 
 
-def _local_llm_max_input_tokens(
+async def _local_llm_max_input_tokens(
     base_url: str, model_name: str, max_output_tokens: int | None
 ) -> int | None:
     """Resolve the effective input window of a ``local:`` (vLLM/OpenAI-compatible) model.
@@ -145,10 +145,13 @@ def _local_llm_max_input_tokens(
     ``model.profile["max_input_tokens"]``, which the deepagents summarization
     middleware multiplies by its 0.85 trigger fraction; without a profile that
     proactive trigger is inert and runs only survive the reactive
-    overflow-retry fallback after vLLM rejects the call. Successful endpoint
-    reads are memoized per (base_url, model, output budget) for the process
-    lifetime: vLLM fixes max_model_len at startup, so re-reading is only
-    useful while the server is still up at build time.
+    overflow-retry fallback after vLLM rejects the call. The models endpoint
+    is read with httpx because model construction happens inside the run's
+    event loop, where a blocking socket call would be rejected by
+    langgraph's blockbuster guard. Successful endpoint reads are memoized per
+    (base_url, model, output budget) for the process lifetime: vLLM fixes
+    max_model_len at startup, so re-reading is only useful while the server
+    is still up at build time.
     """
     cache_key = (base_url, model_name, max_output_tokens or 0)
     cached = _LOCAL_LLM_WINDOW_CACHE.get(cache_key)
@@ -163,9 +166,10 @@ def _local_llm_max_input_tokens(
         else:
             return value if value > 0 else None
     try:
-        request = urllib.request.Request(f"{base_url.rstrip('/')}/models")
-        with urllib.request.urlopen(request, timeout=3) as response:
-            data = json.loads(response.read())
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{base_url.rstrip('/')}/models")
+            response.raise_for_status()
+            data = response.json()
     except Exception:
         logger.warning(
             "Local model profile: could not read %s/models; falling back to overflow-retry only",
@@ -194,11 +198,11 @@ def _local_llm_max_input_tokens(
     return None
 
 
-def _local_llm_model_profile(
+async def _local_llm_model_profile(
     model_name: str, base_url: str, max_output_tokens: int | None
 ) -> dict[str, object]:
     """Profile dict for a local model; empty (inert) when the window is unknown."""
-    max_input_tokens = _local_llm_max_input_tokens(base_url, model_name, max_output_tokens)
+    max_input_tokens = await _local_llm_max_input_tokens(base_url, model_name, max_output_tokens)
     if max_input_tokens is None:
         return {}
     return {
@@ -434,13 +438,18 @@ def _configure_openai_responses_kwargs(model_kwargs: dict[str, object]) -> None:
         include.append("reasoning.encrypted_content")
 
 
-def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpack[ModelKwargs]):
+async def make_model(
+    model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpack[ModelKwargs]
+) -> BaseChatModel:
     """Build a chat model, optionally routed through the LangSmith LLM Gateway.
 
     ``use_gateway`` resolves the deployment default (``LANGSMITH_GATEWAY_ENABLED``)
     when ``None``; async callers pass the team-settings-resolved value. When on,
     gateway ``base_url``/``api_key``/``use_responses_api`` override the direct
-    provider defaults below (see :mod:`agent.utils.gateway`).
+    provider defaults below (see :mod:`agent.utils.gateway``). This is a coroutine:
+    the ``local:`` branch performs an async ``/models`` read (model construction
+    happens inside the run's event loop, where blocking sockets are rejected by
+    langgraph's blockbuster guard), so callers must ``await`` it.
     """
     model_kwargs: dict[str, object] = dict(kwargs)
     model_kwargs.setdefault("max_retries", DEFAULT_MAX_RETRIES)
@@ -477,7 +486,7 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
 
         install_local_reasoning_patch()
 
-        local_profile = _local_llm_model_profile(
+        local_profile = await _local_llm_model_profile(
             model_name, model_kwargs["base_url"], model_kwargs.get("max_tokens")
         )
         if local_profile:
