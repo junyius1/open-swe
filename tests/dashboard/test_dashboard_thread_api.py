@@ -1325,36 +1325,85 @@ async def test_history_proxy_maps_upstream_errors_to_http(monkeypatch) -> None:
     monkeypatch.setattr(thread_api, "langgraph_client", lambda: FakeClient())
 
     seen_timeouts: list[httpx.Timeout] = []
+    history_state = {
+        "values": {"messages": [{"id": "m1", "type": "human", "content": "hi"}]},
+        "next": [],
+        "tasks": [],
+        "metadata": {"step": 1},
+        "created_at": "2026-01-01T00:00:00Z",
+        "checkpoint": {"thread_id": "tid"},
+        "parent_checkpoint": {"thread_id": "tid"},
+        "interrupts": [],
+        "checkpoint_id": "ck1",
+        "parent_checkpoint_id": "ck0",
+    }
 
-    def make_client(error: Exception):
-        class FailingAsyncClient:
+    def make_client(post_error: Exception | None, get_error: Exception | None = None):
+        class MixedAsyncClient:
             def __init__(self, *a: object, **kw: object) -> None:
                 seen_timeouts.append(kw["timeout"])
 
-            async def __aenter__(self) -> "FailingAsyncClient":
+            async def __aenter__(self) -> "MixedAsyncClient":
                 return self
 
             async def __aexit__(self, *a: object) -> None:
                 pass
 
             async def post(self, *a: object, **kw: object) -> None:
-                raise error
+                if post_error is not None:
+                    raise post_error
+                raise AssertionError("post should not be called")
 
-        return FailingAsyncClient
+            async def get(self, *a: object, **kw: object):
+                if get_error is not None:
+                    raise get_error
 
-    # A slow inmem runtime (large checkpoint shards) must not 500 the dashboard,
-    # and history must get the longer read budget instead of the 30s default.
+                class _Resp:
+                    status_code = 200
+                    headers = {"content-type": "application/json"}
+
+                    def json(self):
+                        return history_state
+
+                return _Resp()
+
+        return MixedAsyncClient
+
+    # A slow inmem runtime (large checkpoint shards) must not 500 the dashboard.
+    # When the full history walk times out we degrade to the head-only /state
+    # read (a fast read that returns the same object shape as one history
+    # entry) so the client still gets the latest snapshot.
     monkeypatch.setattr(
-        thread_api.httpx, "AsyncClient", make_client(httpx.ReadTimeout("read timed out"))
+        thread_api.httpx,
+        "AsyncClient",
+        make_client(httpx.ReadTimeout("read timed out"), get_error=None),
+    )
+    seen_timeouts.clear()
+    status, body, media = await thread_api.proxy_dashboard_thread_history(
+        "tid", "teammate", b'{"limit": 1000}'
+    )
+    assert status == 200
+    assert media == "application/json"
+    assert json.loads(body) == [history_state]
+    assert seen_timeouts == [thread_api._HISTORY_PROXY_TIMEOUT, thread_api._STATE_PROXY_TIMEOUT]
+
+    # If the fallback /state read also times out, surface the original 503 so
+    # the client can retry, rather than a 500.
+    monkeypatch.setattr(
+        thread_api.httpx,
+        "AsyncClient",
+        make_client(httpx.ReadTimeout("read timed out"), get_error=httpx.ReadTimeout("again")),
     )
     with pytest.raises(HTTPException) as exc_info:
         await thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 1000}')
     assert exc_info.value.status_code == 503
-    assert seen_timeouts == [thread_api._HISTORY_PROXY_TIMEOUT]
 
-    # Any other transport failure is an upstream 502, not an unhandled 500.
+    # Any other transport failure on the history walk is an upstream 502, not
+    # an unhandled 500.
     monkeypatch.setattr(
-        thread_api.httpx, "AsyncClient", make_client(httpx.ConnectError("connection refused"))
+        thread_api.httpx,
+        "AsyncClient",
+        make_client(httpx.ConnectError("connection refused")),
     )
     with pytest.raises(HTTPException) as exc_info:
         await thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 5}')
