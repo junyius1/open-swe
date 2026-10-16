@@ -3,6 +3,7 @@ import { LoaderCircle } from "lucide-react"
 import { useQueryClient } from "@tanstack/react-query"
 import { useStreamContext as useAgentThreadStream } from "@langchain/react"
 
+import { isAgentRunLive } from "@/features/agents/lib/agentRunStatus"
 import { useIsInAgentThreadStream } from "@/features/agents/lib/provider/useIsInAgentThreadStream"
 import {
   agentThreadKeys,
@@ -183,7 +184,7 @@ function StreamPrimaryActions(props: ComposerPrimaryActionsProps) {
     }
   }
 
-  const running = stream.isLoading || props.activeRun?.running
+  const running = isAgentRunLive(props.activeRun?.running, stream.isLoading)
   useEscapeToStop(
     Boolean(running && props.canSubmit && props.stopOnEscape !== false),
     () => void handleStop()
@@ -191,7 +192,10 @@ function StreamPrimaryActions(props: ComposerPrimaryActionsProps) {
 
   // Server truth (`activeRun.running`) matters as much as the client stream:
   // this browser only sees `isLoading` once it observes a lifecycle event, so a
-  // run it never joined would otherwise render an unusable send button.
+  // run it never joined would otherwise render an unusable send button. The
+  // inverse matters too — once the polled server status reports a finished
+  // run it is authoritative over a `stream.isLoading` that a dropped (and
+  // non-reconnecting) SSE stream can never clear.
   if (!running) return <SendButton {...props} />
 
   return props.canSubmit ? (

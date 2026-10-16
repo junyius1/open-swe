@@ -13,6 +13,7 @@ import { SkillPromptText } from "../SkillBadge"
 import { AgentTurn } from "./timeline/AgentTurn"
 import { liveActivityLabel } from "./timeline/workEntry"
 import { ThinkingSpinner } from "./ThinkingSpinner"
+import { SummaryBlock } from "./SummaryBlock"
 import { UserMessage } from "./UserMessage"
 import type { MessagesProps } from "./types"
 import { TooltipProvider } from "@/components/ui/tooltip"
@@ -83,6 +84,7 @@ export const Messages = memo(function MessagesComponent({
   onReject,
   onAutoApprove,
   onOpenFile,
+  conversationSummary,
 }: MessagesProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
@@ -274,6 +276,9 @@ export const Messages = memo(function MessagesComponent({
             className={`w-full ${contentWidthClass} mx-auto min-w-0 ${contentPaddingClass}`}
             style={bottomInset > 0 ? { paddingBottom: bottomInset } : undefined}
           >
+            {conversationSummary && (
+              <SummaryBlock summary={conversationSummary} />
+            )}
             {visibleMessages.map((message, index) => {
               const isLastMessage = index === visibleMessages.length - 1
               const messageIsStreaming = isStreaming && isLastMessage

@@ -381,6 +381,17 @@ export function streamMessagesToUi(
       messageTimestamp(raw, msgId, resolveCreatedAt)
 
     if (HumanMessage.isInstance(raw)) {
+      // The deepagents summarization middleware tags its compaction summary
+      // `lc_source: "summarization"`. It is not a user turn — when a build
+      // leaks it into the `messages` channel it would otherwise render as a
+      // stray "user" bubble, so keep it out of the transcript (the
+      // `_summarization_event` channel renders it as `SummaryBlock` instead).
+      if (
+        (raw.additional_kwargs as Record<string, unknown> | undefined)
+          ?.lc_source === "summarization"
+      ) {
+        return
+      }
       flushAgentTurn()
       turnKey = typeof raw.id === "string" ? raw.id : undefined
       const content = (raw as unknown as { content?: unknown }).content

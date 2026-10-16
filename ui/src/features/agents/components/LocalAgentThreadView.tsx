@@ -16,6 +16,7 @@ import { AgentPromptBar } from "@/features/agents/components/AgentPromptBar"
 import { ChangesPanel } from "@/features/agents/components/ChangesPanel"
 import { toPanelFiles } from "@/features/agents/components/DiffFilesView"
 import { Messages } from "@/features/agents/components/messages"
+import { StaleStreamRecovery } from "@/features/agents/components/StaleStreamRecovery"
 import { AgentRightPanel } from "@/features/agents/components/panel/AgentRightPanel"
 import { SIBLING_COLUMN_MIN_WIDTH } from "@/features/agents/components/panel/RightPanelShell"
 import {
@@ -42,6 +43,7 @@ import {
   writeStoredPanelCollapsed,
 } from "@/features/agents/lib/gitPanelPreferences"
 import { streamMessagesToUi } from "@/features/agents/lib/streamMessagesToUi"
+import { extractConversationSummary } from "@/features/agents/lib/summaryEvent"
 import { messageArrivalTimestamp } from "@/features/agents/lib/messageTimestamps"
 import { useIsMobile } from "@/lib/useIsMobile"
 import { cn } from "@/lib/utils"
@@ -195,6 +197,14 @@ export function LocalAgentThreadView({ sessionId }: { sessionId: string }) {
     ]
   }, [sessionId, stream.messages, stream.toolCalls, thread])
 
+  // The summarization middleware stashes its compaction summary in the private
+  // `_summarization_event` channel, which leaks into the SDK's `values`
+  // snapshot. Surface it as a collapsible "Summary" block instead of a message.
+  const conversationSummary = useMemo(
+    () => extractConversationSummary(stream.values),
+    [stream.values]
+  )
+
   const rememberSelection = useCallback(
     async (model?: ModelSelection | null) => {
       if (!model) return
@@ -338,6 +348,10 @@ export function LocalAgentThreadView({ sessionId }: { sessionId: string }) {
 
   return (
     <div className="flex min-w-0 flex-1">
+      <StaleStreamRecovery
+        threadId={sessionId}
+        serverRunning={Boolean(thread?.pending) || activity === "running"}
+      />
       <div
         className="flex min-w-0 flex-1 flex-col"
         style={isMobile ? undefined : { minWidth: SIBLING_COLUMN_MIN_WIDTH }}
@@ -379,6 +393,7 @@ export function LocalAgentThreadView({ sessionId }: { sessionId: string }) {
             messages={messages}
             onOpenFile={handleOpenFile}
             streamIsLoading={stream.isLoading}
+            conversationSummary={conversationSummary}
           />
           <div className="shrink-0 px-4 pb-4">
             <div className="mx-auto w-full max-w-3xl min-w-0">
