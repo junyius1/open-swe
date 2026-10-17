@@ -1338,7 +1338,10 @@ async def test_history_proxy_maps_upstream_errors_to_http(monkeypatch) -> None:
         "parent_checkpoint_id": "ck0",
     }
 
-    def make_client(post_error: Exception | None, get_error: Exception | None = None):
+    def make_client(
+        fallback_post_error: Exception | None = None,
+        fallback_get_error: Exception | None = None,
+    ):
         class MixedAsyncClient:
             def __init__(self, *a: object, **kw: object) -> None:
                 seen_timeouts.append(kw["timeout"])
@@ -1349,14 +1352,24 @@ async def test_history_proxy_maps_upstream_errors_to_http(monkeypatch) -> None:
             async def __aexit__(self, *a: object) -> None:
                 pass
 
-            async def post(self, *a: object, **kw: object) -> None:
-                if post_error is not None:
-                    raise post_error
-                raise AssertionError("post should not be called")
+            async def post(self, *a: object, **kw: object):
+                # The full history walk (the original request) always fails
+                # here; the limit=1 fallback may succeed.
+                if kw.get("json") != {"limit": 1}:
+                    raise httpx.ReadTimeout("read timed out")
+                if fallback_post_error is not None:
+                    raise fallback_post_error
+
+                class _EntryResp:
+                    status_code = 200
+                    content = json.dumps([history_state]).encode("utf-8")
+                    headers = {"content-type": "application/json"}
+
+                return _EntryResp()
 
             async def get(self, *a: object, **kw: object):
-                if get_error is not None:
-                    raise get_error
+                if fallback_get_error is not None:
+                    raise fallback_get_error
 
                 class _Resp:
                     status_code = 200
@@ -1369,16 +1382,12 @@ async def test_history_proxy_maps_upstream_errors_to_http(monkeypatch) -> None:
 
         return MixedAsyncClient
 
-    # A slow inmem runtime (large checkpoint shards) must not 500 the dashboard.
-    # When the full history walk times out we degrade to the head-only /state
-    # read (a fast read that returns the same object shape as one history
-    # entry) so the client still gets the latest snapshot.
-    monkeypatch.setattr(
-        thread_api.httpx,
-        "AsyncClient",
-        make_client(httpx.ReadTimeout("read timed out"), get_error=None),
-    )
-    seen_timeouts.clear()
+    # A slow inmem runtime (large checkpoint shards) must not 500 the
+    # dashboard. When the full history walk times out we degrade to the
+    # head-only latest history entry, so the client still gets the latest
+    # snapshot.
+    monkeypatch.setattr(thread_api.httpx, "AsyncClient", make_client())
+    del seen_timeouts[:]
     status, body, media = await thread_api.proxy_dashboard_thread_history(
         "tid", "teammate", b'{"limit": 1000}'
     )
@@ -1387,24 +1396,52 @@ async def test_history_proxy_maps_upstream_errors_to_http(monkeypatch) -> None:
     assert json.loads(body) == [history_state]
     assert seen_timeouts == [thread_api._HISTORY_PROXY_TIMEOUT, thread_api._STATE_PROXY_TIMEOUT]
 
-    # If the fallback /state read also times out, surface the original 503 so
-    # the client can retry, rather than a 500.
+    # If the fallback reads keep timing out (the abandoned history request is
+    # still queued on the single-worker runtime), retry with backoff and only
+    # surface the 503 after all attempts, so the client can retry.
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(thread_api.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(
         thread_api.httpx,
         "AsyncClient",
-        make_client(httpx.ReadTimeout("read timed out"), get_error=httpx.ReadTimeout("again")),
+        make_client(
+            fallback_post_error=httpx.ReadTimeout("again"),
+            fallback_get_error=httpx.ReadTimeout("still again"),
+        ),
     )
+    del seen_timeouts[:]
     with pytest.raises(HTTPException) as exc_info:
         await thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 1000}')
     assert exc_info.value.status_code == 503
-
-    # Any other transport failure on the history walk is an upstream 502, not
-    # an unhandled 500.
-    monkeypatch.setattr(
-        thread_api.httpx,
-        "AsyncClient",
-        make_client(httpx.ConnectError("connection refused")),
+    assert (
+        seen_timeouts
+        == [thread_api._HISTORY_PROXY_TIMEOUT]
+        + [thread_api._STATE_PROXY_TIMEOUT] * thread_api._FALLBACK_ATTEMPTS
     )
+    assert sleeps == [1.5, 3.0]
+
+    # Any transport failure on the history walk is an upstream 502, not an
+    # unhandled 500.
+    class RefuseClient:
+        def __init__(self, *a: object, **kw: object) -> None:
+            seen_timeouts.append(kw["timeout"])
+
+        async def __aenter__(self) -> "RefuseClient":
+            return self
+
+        async def __aexit__(self, *a: object) -> None:
+            pass
+
+        async def post(self, *a: object, **kw: object) -> None:
+            raise httpx.ConnectError("connection refused")
+
+        async def get(self, *a: object, **kw: object) -> None:
+            raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(thread_api.httpx, "AsyncClient", RefuseClient)
     with pytest.raises(HTTPException) as exc_info:
         await thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 5}')
     assert exc_info.value.status_code == 502

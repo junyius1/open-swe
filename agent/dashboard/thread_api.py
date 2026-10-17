@@ -89,10 +89,14 @@ _PROXY_REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 _HISTORY_PROXY_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
 _DISCOVERY_HISTORY_LIMIT = 5
 # Bounded fallbacks for pathologically large threads: when the full history
-# walk times out we serve the latest state (a fast, head-only read) instead of
+# walk times out we serve the latest state (a head-only read) instead of
 # failing, and the send path's pre-run state read is bounded so an oversized
-# thread cannot stall message submission indefinitely.
+# thread cannot stall message submission indefinitely. The abandoned history
+# request is still queued on the single-worker runtime, so the fallback retries
+# with backoff instead of spending its budget behind it.
 _STATE_PROXY_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+_FALLBACK_ATTEMPTS = 3
+_FALLBACK_RETRY_BASE_DELAY = 1.5
 _GET_STATE_TIMEOUT = 15.0
 _PROXY_STREAM_TIMEOUT = httpx.Timeout(None)
 _THREAD_POST_COMMAND_METHODS = frozenset(
@@ -2687,41 +2691,84 @@ async def proxy_dashboard_thread_commands(
     return response.status_code, response.content, media_type
 
 
+async def _history_head_read(
+    thread_id: str,
+) -> httpx.Response:
+    """One head-only fallback read: the latest history entry, else the latest
+    state normalized to the single-entry history shape the client expects.
+
+    ``/history {"limit": 1}`` and ``/state`` return the same object shape as
+    one history entry, so the client's history handling is unaffected.
+    """
+    runtime_base = langgraph_url().rstrip("/")
+    headers = _langgraph_proxy_headers(content_type="application/json")
+    async with httpx.AsyncClient(timeout=_STATE_PROXY_TIMEOUT) as client:
+        response = await client.post(
+            f"{runtime_base}/threads/{thread_id}/history",
+            json={"limit": 1},
+            headers=headers,
+        )
+    if response.status_code != 200:
+        logger.info(
+            "History fallback limit=1 returned %s for thread %s; trying /state",
+            response.status_code,
+            thread_id,
+        )
+        response = await client.get(f"{runtime_base}/threads/{thread_id}/state", headers=headers)
+        if response.status_code != 200:
+            raise LookupError(
+                f"history fallback limit=1 returned {response.status_code} for thread {thread_id}"
+            )
+        return httpx.Response(
+            200,
+            content=json.dumps([response.json()]).encode("utf-8"),
+            headers={"content-type": "application/json"},
+        )
+    return response
+
+
 async def _history_state_fallback(
     thread_id: str,
     content_type: str,
     *,
     reason: str,
 ) -> tuple[int, bytes, str | None]:
-    """Serve the latest state (as a single history entry) when the full
+    """Serve the latest snapshot (as a single history entry) when the full
     history walk cannot complete in time.
 
-    ``GET /threads/{id}/state`` is a head-only read that returns the same
-    object shape as one ``/history`` entry, so the client's history
-    handling is unaffected. This keeps oversized threads (long
-    delta-snapshot message history) responsive at the cost of only the
-    latest snapshot instead of older ones.
+    The abandoned history request is still queued on the single-worker
+    runtime, so the first fallback attempt usually burns its budget behind
+    it; retry with backoff before giving up, keeping 503 a last resort.
     """
-    url = f"{langgraph_url().rstrip('/')}/threads/{thread_id}/state"
-    headers = _langgraph_proxy_headers(content_type="application/json")
     logger.info("History proxy degrading to /state for thread %s: %s", thread_id, reason)
-    try:
-        async with httpx.AsyncClient(timeout=_STATE_PROXY_TIMEOUT) as client:
-            response = await client.get(url, headers=headers)
-    except httpx.TimeoutException:
-        logger.warning("History fallback /state also timed out for thread %s", thread_id)
-        raise HTTPException(503, "thread history request timed out; retry") from None
-    except httpx.HTTPError:
-        logger.warning(
-            "History fallback /state could not reach the LangGraph runtime",
-            exc_info=True,
-        )
-        raise HTTPException(502, "could not reach the LangGraph runtime") from None
-    if response.status_code != 200:
-        raise HTTPException(503, "thread history request timed out; retry")
-    # Normalize the state object to the history list shape the client expects.
-    body = json.dumps([response.json()]).encode("utf-8")
-    return 200, body, "application/json"
+    for attempt in range(1, _FALLBACK_ATTEMPTS + 1):
+        try:
+            response = await _history_head_read(thread_id)
+        except httpx.TimeoutException:
+            logger.warning("History fallback attempt %d missed for thread %s", attempt, thread_id)
+        except LookupError:
+            logger.warning("History fallback attempt %d missed for thread %s", attempt, thread_id)
+        except httpx.HTTPError:
+            logger.warning(
+                "History fallback could not reach the LangGraph runtime for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+            raise HTTPException(502, "could not reach the LangGraph runtime") from None
+        else:
+            media_type = response.headers.get("content-type")
+            return 200, response.content, media_type
+        if attempt < _FALLBACK_ATTEMPTS:
+            delay = _FALLBACK_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.info(
+                "History fallback retrying thread %s in %.1fs (attempt %d/%d)",
+                thread_id,
+                delay,
+                attempt,
+                _FALLBACK_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+    raise HTTPException(503, "thread history request timed out; retry")
 
 
 async def proxy_dashboard_thread_history(
