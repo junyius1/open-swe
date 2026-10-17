@@ -88,6 +88,12 @@ _PROXY_REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 # can exceed the generic 30s read budget.
 _HISTORY_PROXY_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
 _DISCOVERY_HISTORY_LIMIT = 5
+# Bounded fallbacks for pathologically large threads: when the full history
+# walk times out we serve the latest state (a fast, head-only read) instead of
+# failing, and the send path's pre-run state read is bounded so an oversized
+# thread cannot stall message submission indefinitely.
+_STATE_PROXY_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+_GET_STATE_TIMEOUT = 15.0
 _PROXY_STREAM_TIMEOUT = httpx.Timeout(None)
 _THREAD_POST_COMMAND_METHODS = frozenset(
     {"run.start", "input.respond", "input.inject", "state.fork"}
@@ -1665,7 +1671,13 @@ async def _enrich_run_start_command(
     persisted_message_ids: set[str] = set()
     if not creating:
         try:
-            prior_state = await client.threads.get_state(thread_id)
+            # Bounded: on oversized threads the state read walks the full
+            # checkpoint history and can stall message submission; on timeout
+            # we proceed without the dedup/context-hash pre-read (degrades
+            # gracefully, mirroring the except branch).
+            prior_state = await asyncio.wait_for(
+                client.threads.get_state(thread_id), timeout=_GET_STATE_TIMEOUT
+            )
             values = prior_state.get("values") if isinstance(prior_state, dict) else None
             if isinstance(values, dict):
                 messages = values.get("messages")
@@ -2675,6 +2687,43 @@ async def proxy_dashboard_thread_commands(
     return response.status_code, response.content, media_type
 
 
+async def _history_state_fallback(
+    thread_id: str,
+    content_type: str,
+    *,
+    reason: str,
+) -> tuple[int, bytes, str | None]:
+    """Serve the latest state (as a single history entry) when the full
+    history walk cannot complete in time.
+
+    ``GET /threads/{id}/state`` is a head-only read that returns the same
+    object shape as one ``/history`` entry, so the client's history
+    handling is unaffected. This keeps oversized threads (long
+    delta-snapshot message history) responsive at the cost of only the
+    latest snapshot instead of older ones.
+    """
+    url = f"{langgraph_url().rstrip('/')}/threads/{thread_id}/state"
+    headers = _langgraph_proxy_headers(content_type="application/json")
+    logger.info("History proxy degrading to /state for thread %s: %s", thread_id, reason)
+    try:
+        async with httpx.AsyncClient(timeout=_STATE_PROXY_TIMEOUT) as client:
+            response = await client.get(url, headers=headers)
+    except httpx.TimeoutException:
+        logger.warning("History fallback /state also timed out for thread %s", thread_id)
+        raise HTTPException(503, "thread history request timed out; retry") from None
+    except httpx.HTTPError:
+        logger.warning(
+            "History fallback /state could not reach the LangGraph runtime",
+            exc_info=True,
+        )
+        raise HTTPException(502, "could not reach the LangGraph runtime") from None
+    if response.status_code != 200:
+        raise HTTPException(503, "thread history request timed out; retry")
+    # Normalize the state object to the history list shape the client expects.
+    body = json.dumps([response.json()]).encode("utf-8")
+    return 200, body, "application/json"
+
+
 async def proxy_dashboard_thread_history(
     thread_id: str,
     login: str,
@@ -2701,11 +2750,15 @@ async def proxy_dashboard_thread_history(
     try:
         async with httpx.AsyncClient(timeout=_HISTORY_PROXY_TIMEOUT) as client:
             response = await client.post(url, json=payload, headers=headers)
-    except httpx.TimeoutException as exc:
+    except httpx.TimeoutException:
         logger.warning(
             "History proxy timed out for thread %s (limit=%r)", thread_id, payload.get("limit")
         )
-        raise HTTPException(503, "thread history request timed out; retry") from exc
+        return await _history_state_fallback(
+            thread_id,
+            content_type,
+            reason=f"history walk timed out (limit={payload.get('limit')!r})",
+        )
     except httpx.HTTPError as exc:
         logger.warning("History proxy could not reach the LangGraph runtime", exc_info=True)
         raise HTTPException(502, "could not reach the LangGraph runtime") from exc
