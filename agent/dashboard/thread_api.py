@@ -83,7 +83,36 @@ _SUPPORTED_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif",
 _MAX_DASHBOARD_IMAGES = 5
 _MAX_DASHBOARD_IMAGE_BYTES = 10 * 1024 * 1024
 _PROXY_REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+# History walks and deserializes every checkpoint of the thread; in the inmem
+# dev runtime that comes off multi-GB pickle shards, so full-history fetches
+# can exceed the generic 30s read budget.
+_HISTORY_PROXY_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
 _DISCOVERY_HISTORY_LIMIT = 5
+# Bounded fallbacks for pathologically large threads: when the full history
+# walk times out we serve the latest state (a head-only read) instead of
+# failing, and the send path's pre-run state read is bounded so an oversized
+# thread cannot stall message submission indefinitely. The abandoned history
+# request is still queued on the single-worker runtime, so the fallback retries
+# with backoff instead of spending its budget behind it.
+_STATE_PROXY_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+_FALLBACK_ATTEMPTS = 3
+_FALLBACK_RETRY_BASE_DELAY = 1.5
+_GET_STATE_TIMEOUT = 15.0
+# Concurrent identical history requests (the client retries with the same
+# payload) each queue a full checkpoint deserialization on the single-worker
+# runtime, starving each other's budgets; coalescing them into one upstream
+# call removes that amplification.
+_HISTORY_COALESCING: dict[str, dict[str, Any]] = {}
+_HISTORY_COALESCING_PRUNE_AT = 32
+_FALLBACK_LOCKS: dict[str, asyncio.Lock] = {}
+
+# Short-lived cache of a successful fallback snapshot per thread. The
+# /state snapshot is a valid (if lossy) history substitute and is stable
+# while the thread is idle, so callers that lose the coalesced history race
+# can share one fallback walk instead of each running their own; the TTL
+# bounds the staleness window for a thread that keeps producing runs.
+_FALLBACK_SNAPSHOT_CACHE: dict[str, tuple[float, int, bytes, str | None]] = {}
+_FALLBACK_SNAPSHOT_CACHE_TTL_SECONDS = 30.0
 _PROXY_STREAM_TIMEOUT = httpx.Timeout(None)
 _THREAD_POST_COMMAND_METHODS = frozenset(
     {"run.start", "input.respond", "input.inject", "state.fork"}
@@ -1661,7 +1690,13 @@ async def _enrich_run_start_command(
     persisted_message_ids: set[str] = set()
     if not creating:
         try:
-            prior_state = await client.threads.get_state(thread_id)
+            # Bounded: on oversized threads the state read walks the full
+            # checkpoint history and can stall message submission; on timeout
+            # we proceed without the dedup/context-hash pre-read (degrades
+            # gracefully, mirroring the except branch).
+            prior_state = await asyncio.wait_for(
+                client.threads.get_state(thread_id), timeout=_GET_STATE_TIMEOUT
+            )
             values = prior_state.get("values") if isinstance(prior_state, dict) else None
             if isinstance(values, dict):
                 messages = values.get("messages")
@@ -2671,6 +2706,156 @@ async def proxy_dashboard_thread_commands(
     return response.status_code, response.content, media_type
 
 
+async def _shared_history_request(
+    thread_id: str,
+    payload: dict[str, Any],
+    content_type: str,
+) -> httpx.Response:
+    """Issue one runtime history call per thread+payload, shared by
+    concurrent callers so identical in-flight requests do not multiply the
+    runtime load."""
+    key = f"{thread_id}:{json.dumps(payload, sort_keys=True)}"
+    shared = _HISTORY_COALESCING.get(key)
+    if shared is None:
+        if len(_HISTORY_COALESCING) >= _HISTORY_COALESCING_PRUNE_AT:
+            for done_key in [
+                entry_key
+                for entry_key, entry in _HISTORY_COALESCING.items()
+                if entry["event"].is_set()
+            ]:
+                _HISTORY_COALESCING.pop(done_key, None)
+        shared = {"event": asyncio.Event(), "response": None, "exc": None}
+        _HISTORY_COALESCING[key] = shared
+        url = f"{langgraph_url().rstrip('/')}/threads/{thread_id}/history"
+        headers = _langgraph_proxy_headers(content_type=content_type)
+        try:
+            async with httpx.AsyncClient(timeout=_HISTORY_PROXY_TIMEOUT) as client:
+                shared["response"] = await client.post(url, json=payload, headers=headers)
+        except Exception as exc:
+            shared["exc"] = exc
+        finally:
+            # Late joiners see a fresh key and start their own call; in-flight
+            # followers keep holding the shared dict reference.
+            shared["event"].set()
+            _HISTORY_COALESCING.pop(key, None)
+    else:
+        await shared["event"].wait()
+    exc = shared["exc"]
+    response = shared["response"]
+    if exc is not None:
+        raise exc
+    assert response is not None
+    return response
+
+
+async def _history_head_read(
+    thread_id: str,
+) -> httpx.Response:
+    """One head-only fallback read: the latest history entry, else the latest
+    state normalized to the single-entry history shape the client expects.
+
+    ``/history {"limit": 1}`` and ``/state`` return the same object shape as
+    one history entry, so the client's history handling is unaffected.
+    """
+    runtime_base = langgraph_url().rstrip("/")
+    headers = _langgraph_proxy_headers(content_type="application/json")
+    async with httpx.AsyncClient(timeout=_STATE_PROXY_TIMEOUT) as client:
+        response = await client.post(
+            f"{runtime_base}/threads/{thread_id}/history",
+            json={"limit": 1},
+            headers=headers,
+        )
+    if response.status_code != 200:
+        logger.info(
+            "History fallback limit=1 returned %s for thread %s; trying /state",
+            response.status_code,
+            thread_id,
+        )
+        response = await client.get(f"{runtime_base}/threads/{thread_id}/state", headers=headers)
+        if response.status_code != 200:
+            raise LookupError(
+                f"history fallback limit=1 returned {response.status_code} for thread {thread_id}"
+            )
+        return httpx.Response(
+            200,
+            content=json.dumps([response.json()]).encode("utf-8"),
+            headers={"content-type": "application/json"},
+        )
+    return response
+
+
+async def _history_state_fallback(
+    thread_id: str,
+    content_type: str,
+    *,
+    reason: str,
+) -> tuple[int, bytes, str | None]:
+    """Serve the latest snapshot (as a single history entry) when the full
+    history walk cannot complete in time; serialized per thread so concurrent
+    duplicates do not multiply the runtime load."""
+    loop = asyncio.get_running_loop()
+    cached = _FALLBACK_SNAPSHOT_CACHE.get(thread_id)
+    if cached is not None and loop.time() - cached[0] < _FALLBACK_SNAPSHOT_CACHE_TTL_SECONDS:
+        _, status, body, media_type = cached
+        return status, body, media_type
+    lock = _FALLBACK_LOCKS.setdefault(thread_id, asyncio.Lock())
+    async with lock:
+        cached = _FALLBACK_SNAPSHOT_CACHE.get(thread_id)
+        if cached is not None and loop.time() - cached[0] < _FALLBACK_SNAPSHOT_CACHE_TTL_SECONDS:
+            _, status, body, media_type = cached
+            return status, body, media_type
+        status, body, media_type = await _history_state_fallback_serialized(
+            thread_id, content_type, reason=reason
+        )
+        if status == 200:
+            _FALLBACK_SNAPSHOT_CACHE[thread_id] = (loop.time(), status, body, media_type)
+        return status, body, media_type
+
+
+async def _history_state_fallback_serialized(
+    thread_id: str,
+    content_type: str,
+    *,
+    reason: str,
+) -> tuple[int, bytes, str | None]:
+    """Serve the latest snapshot (as a single history entry) when the full
+    history walk cannot complete in time.
+
+    The abandoned history request is still queued on the single-worker
+    runtime, so the first fallback attempt usually burns its budget behind
+    it; retry with backoff before giving up, keeping 503 a last resort.
+    """
+    logger.info("History proxy degrading to /state for thread %s: %s", thread_id, reason)
+    for attempt in range(1, _FALLBACK_ATTEMPTS + 1):
+        try:
+            response = await _history_head_read(thread_id)
+        except httpx.TimeoutException:
+            logger.warning("History fallback attempt %d missed for thread %s", attempt, thread_id)
+        except LookupError:
+            logger.warning("History fallback attempt %d missed for thread %s", attempt, thread_id)
+        except httpx.HTTPError:
+            logger.warning(
+                "History fallback could not reach the LangGraph runtime for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+            raise HTTPException(502, "could not reach the LangGraph runtime") from None
+        else:
+            media_type = response.headers.get("content-type")
+            return 200, response.content, media_type
+        if attempt < _FALLBACK_ATTEMPTS:
+            delay = _FALLBACK_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.info(
+                "History fallback retrying thread %s in %.1fs (attempt %d/%d)",
+                thread_id,
+                delay,
+                attempt,
+                _FALLBACK_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+    raise HTTPException(503, "thread history request timed out; retry")
+
+
 async def proxy_dashboard_thread_history(
     thread_id: str,
     login: str,
@@ -2692,10 +2877,20 @@ async def proxy_dashboard_thread_history(
         raise HTTPException(400, "history limit must be a positive integer")
     if not any(payload.get(key) for key in ("before", "checkpoint", "metadata")):
         payload["limit"] = min(limit, _DISCOVERY_HISTORY_LIMIT)
-    url = f"{langgraph_url().rstrip('/')}/threads/{thread_id}/history"
-    headers = _langgraph_proxy_headers(content_type=content_type)
-    async with httpx.AsyncClient(timeout=_PROXY_REQUEST_TIMEOUT) as client:
-        response = await client.post(url, json=payload, headers=headers)
+    try:
+        response = await _shared_history_request(thread_id, payload, content_type)
+    except httpx.TimeoutException:
+        logger.warning(
+            "History proxy timed out for thread %s (limit=%r)", thread_id, payload.get("limit")
+        )
+        return await _history_state_fallback(
+            thread_id,
+            content_type,
+            reason=f"history walk timed out (limit={payload.get('limit')!r})",
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("History proxy could not reach the LangGraph runtime", exc_info=True)
+        raise HTTPException(502, "could not reach the LangGraph runtime") from exc
     media_type = response.headers.get("content-type")
     return response.status_code, response.content, media_type
 

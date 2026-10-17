@@ -843,14 +843,14 @@ def _format_existing_findings(findings: list[Finding]) -> str:
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
 
-def _make_model_or_defer(
+async def _make_model_or_defer(
     model_id: str,
     *,
     use_gateway: bool,
     **kwargs: Any,
 ) -> BaseChatModel:
     try:
-        return make_model(model_id, use_gateway=use_gateway, **kwargs)
+        return await make_model(model_id, use_gateway=use_gateway, **kwargs)
     except Exception as e:  # noqa: BLE001
         logger.warning("Deferring reviewer model setup failure for %s", model_id, exc_info=True)
         return make_deferred_error_model(e, model_id=model_id)
@@ -890,7 +890,7 @@ async def _resolve_grouping_model(
         max_tokens=DEFAULT_LLM_MAX_TOKENS,
         openai_reasoning_default=DEFAULT_LLM_REASONING,
     )
-    return _make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs)
+    return await _make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs)
 
 
 async def _cached_reviewer_team_defaults():
@@ -1387,8 +1387,8 @@ async def get_reviewer_agent(config: RunnableConfig) -> Pregel:
     )
 
     use_gateway = await _cached_gateway_enabled()
-    reviewer_model = _make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs)
-    reviewer_subagent_model = _make_model_or_defer(
+    reviewer_model = await _make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs)
+    reviewer_subagent_model = await _make_model_or_defer(
         subagent_model_id, use_gateway=use_gateway, **subagent_model_kwargs
     )
 

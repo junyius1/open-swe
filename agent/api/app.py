@@ -49,9 +49,11 @@ def create_app() -> FastAPI:
     if allowed_origins:
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=allowed_origins,
+            #allow_origins=allowed_origins,
+            allow_origins=["*"],  # 强行允许所有来源！
             allow_credentials=True,
-            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            #allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            allow_methods=["*"],  # 允许所有方法包括 OPTIONS 预检！
             allow_headers=["*"],
         )
     app.include_router(dashboard_router)

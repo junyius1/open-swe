@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from langgraph_sdk import get_client
+from ..utils.thread_ops import langgraph_client
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from ..encryption import decrypt_token, encrypt_token
@@ -25,7 +25,7 @@ _NOTION_TOKEN_EXPIRY_SKEW_SECONDS = 300
 
 
 def _client():
-    return get_client()
+    return langgraph_client()
 
 
 def _last4(value: str) -> str:

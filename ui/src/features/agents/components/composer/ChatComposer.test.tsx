@@ -80,11 +80,21 @@ describe("ChatComposer stop button", () => {
 
   it("cancels server-side even while streaming, since stop() may know no run id", async () => {
     stream.isLoading = true
-    renderComposer(false)
+    renderComposer(true)
 
     fireEvent.click(screen.getByRole("button", { name: "Stop run" }))
 
     await waitFor(() => expect(cancelThread).toHaveBeenCalledWith("thread-1"))
+  })
+
+  it("drops the stop button once the server reports the run finished", async () => {
+    // A dropped (non-reconnecting) SSE stream leaves `isLoading` stuck after
+    // the run ends server-side; the polled status is authoritative, so the
+    // stale client flag must not keep a dead stop button on screen.
+    stream.isLoading = true
+    renderComposer(false)
+
+    expect(screen.queryByRole("button", { name: "Stop run" })).toBeNull()
   })
 
   it("keeps the run live when cancellation fails", async () => {

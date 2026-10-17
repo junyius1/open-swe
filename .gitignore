@@ -82,3 +82,9 @@ logs/
 test-results/
 playwright-report/
 blob-report/
+
+
+3partylibs/
+code_graphrag/
+*.jsonl
+conversation_history/

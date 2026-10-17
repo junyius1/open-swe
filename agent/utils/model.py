@@ -1,12 +1,18 @@
 import asyncio
+import logging
 import os
+from collections.abc import Mapping
 from typing import Any, Literal, TypedDict, Unpack, cast
 
+import httpx
 from langchain.chat_models import init_chat_model
+from langchain_core.language_models import BaseChatModel
 
 from ..dashboard.options import DEFAULT_MODEL_ID, model_profile_with_context_override
 from .gateway import gateway_env_default, gateway_overrides
 from .openai_oauth import build_desktop_openai_oauth_model, desktop_openai_oauth_available
+
+logger = logging.getLogger(__name__)
 
 OPENAI_RESPONSES_WS_BASE_URL = "wss://api.openai.com/v1"
 
@@ -94,9 +100,320 @@ class ModelKwargs(TypedDict, total=False):
     include: list[str] | None
     output_version: Literal["responses/v1"] | None
     model_kwargs: dict[str, object] | None
+    extra_body: dict[str, object] | None  # 👈 【新增这一行】：允许向底层透传请求体参数
 
 
 _ANTHROPIC_EFFORTS: set[AnthropicEffort] = {"low", "medium", "high", "xhigh", "max"}
+
+
+_LOCAL_OVERFLOW_PATTERNS = (
+    "maximum context length",
+    "exceeds the context length",
+    "context length exceeded",
+    "context length is exceeded",
+    "context window exceeded",
+    "context window limit exceeded",
+    "exceed the model's context length",
+)
+_local_overflow_installed = False
+
+
+def _is_context_overflow_error(e: BaseException) -> bool:
+    """Detect OpenAI-compatible (vLLM/TGI/llama.cpp) context-overflow rejections."""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and isinstance(err.get("message"), str):
+            body = err
+    text = f"{getattr(e, 'message', None) or ''} {body}".lower()
+    if any(pattern in text for pattern in _LOCAL_OVERFLOW_PATTERNS):
+        return True
+    return "input_tokens" in text and "context" in text
+
+
+_LOCAL_LLM_WINDOW_CACHE: dict[tuple[str, str, int], int] = {}
+
+
+async def _local_llm_max_input_tokens(
+    base_url: str, model_name: str, max_output_tokens: int | None
+) -> int | None:
+    """Resolve the effective input window of a ``local:`` (vLLM/OpenAI-compatible) model.
+
+    Precedence: the ``LOCAL_LLM_MAX_INPUT_TOKENS`` env override (verbatim),
+    then the serving stack's ``max_model_len`` from ``GET {base_url}/models``
+    minus the output budget. The profile value feeds
+    ``model.profile["max_input_tokens"]``, which the deepagents summarization
+    middleware multiplies by its 0.85 trigger fraction; without a profile that
+    proactive trigger is inert and runs only survive the reactive
+    overflow-retry fallback after vLLM rejects the call. The models endpoint
+    is read with httpx because model construction happens inside the run's
+    event loop, where a blocking socket call would be rejected by
+    langgraph's blockbuster guard. Successful endpoint reads are memoized per
+    (base_url, model, output budget) for the process lifetime: vLLM fixes
+    max_model_len at startup, so re-reading is only useful while the server
+    is still up at build time.
+    """
+    cache_key = (base_url, model_name, max_output_tokens or 0)
+    cached = _LOCAL_LLM_WINDOW_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    override = os.environ.get("LOCAL_LLM_MAX_INPUT_TOKENS", "").strip()
+    if override:
+        try:
+            value = int(override)
+        except ValueError:
+            logger.warning("Ignoring invalid LOCAL_LLM_MAX_INPUT_TOKENS: %r", override)
+        else:
+            return value if value > 0 else None
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{base_url.rstrip('/')}/models")
+            response.raise_for_status()
+            data = response.json()
+    except Exception:
+        logger.warning(
+            "Local model profile: could not read %s/models; falling back to overflow-retry only",
+            base_url,
+            exc_info=True,
+        )
+        return None
+    for entry in (data or {}).get("data") or []:
+        if not isinstance(entry, dict) or entry.get("id") not in (
+            model_name,
+            model_name.lstrip("/"),
+        ):
+            continue
+        try:
+            window = int(entry.get("max_model_len") or 0)
+        except (TypeError, ValueError):
+            return None
+        if window <= 0:
+            return None
+        # max_model_len spans input + output; the profile must reflect input
+        # headroom only, or the 0.85 trigger fires after the window fills.
+        out = max_output_tokens if type(max_output_tokens) is int and max_output_tokens > 0 else 0
+        resolved = max(1, window - out)
+        _LOCAL_LLM_WINDOW_CACHE[cache_key] = resolved
+        return resolved
+    return None
+
+
+async def _local_llm_model_profile(
+    model_name: str, base_url: str, max_output_tokens: int | None
+) -> dict[str, object]:
+    """Profile dict for a local model; empty (inert) when the window is unknown."""
+    max_input_tokens = await _local_llm_max_input_tokens(base_url, model_name, max_output_tokens)
+    if max_input_tokens is None:
+        return {}
+    return {
+        "name": model_name,
+        "open_weights": True,
+        "tool_calling": True,
+        "max_input_tokens": max_input_tokens,
+    }
+
+
+def install_context_overflow_error_patch() -> None:
+    """Wrap langchain-openai's BadRequest handling so vLLM-style context overflows become ContextOverflowError.
+
+    Without this, the deepagents summarization middleware's overflow-retry fallback never engages.
+    """
+    global _local_overflow_installed
+    if _local_overflow_installed:
+        return
+    try:
+        from langchain_openai.chat_models import base as lo_base
+    except ImportError:
+        return
+    if getattr(lo_base, "_open_swe_overflow_patched", False):
+        _local_overflow_installed = True
+        return
+
+    original = lo_base._handle_openai_bad_request
+
+    def _patched_handle_openai_bad_request(e: BaseException) -> None:
+        try:
+            original(e)
+            return
+        except lo_base.ContextOverflowError:
+            raise
+        except BaseException as raised:
+            # The original handler re-raises unmatched errors via a bare
+            # `raise`; outside an exception context that surfaces as
+            # RuntimeError, so fall back to the error passed in.
+            source = (
+                e
+                if isinstance(raised, RuntimeError) and "No active exception" in str(raised)
+                else raised
+            )
+            if _is_context_overflow_error(source):
+                raise lo_base.OpenAIContextOverflowError(
+                    message=str(getattr(source, "message", None) or source),
+                    response=getattr(source, "response", None),
+                    body=getattr(source, "body", None),
+                ) from source
+            raise source from None
+
+    lo_base._handle_openai_bad_request = _patched_handle_openai_bad_request
+    lo_base._open_swe_overflow_patched = True
+    _local_overflow_installed = True
+
+
+_local_reasoning_installed = False
+
+# The base ``ChatOpenAI`` stamps ``model_provider="openai"`` on every
+# chat-completions chunk, which routes ``content_blocks`` to the OpenAI
+# translator — that translator (in both Python and the ``@langchain/core``
+# JS) understands the Responses-API reasoning shape but drops the
+# ``reasoning_content``/``reasoning`` fields that Qwen/vLLM/DashScope
+# actually emit.
+# ``"deepseek"`` is the one provider label that resolves to a
+# reasoning-content-aware path on both sides: Python has no ``deepseek``
+# translator (so ``content_blocks`` falls back to its built-in
+# ``additional_kwargs["reasoning_content"]`` extraction) and the JS side
+# registers a ``deepseek`` translator that reads ``reasoning_content``.
+_LOCAL_REASONING_MODEL_PROVIDER = "deepseek"
+_LOCAL_REASONING_MODEL_PROVIDER_KEY = "model_provider"
+_LOCAL_REASONING_MARKER = "_open_swe_local_reasoning"
+# OpenAI-compatible servers disagree on the thinking field name: Qwen /
+# DashScope (and some vLLM chat templates) emit ``reasoning_content``,
+# others emit plain ``reasoning``. Both carry the same thinking tokens.
+_LOCAL_REASONING_FIELD_KEYS = ("reasoning_content", "reasoning")
+
+
+def _delta_reasoning_text(chunk: Mapping[str, Any]) -> str | None:
+    """Extract the thinking slice from a chat-completions stream chunk's delta."""
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0]
+    if not isinstance(choice, Mapping):
+        return None
+    delta = choice.get("delta")
+    if not isinstance(delta, Mapping):
+        return None
+    return _first_reasoning_field(delta)
+
+
+def _message_reasoning_text(message: Any) -> str | None:
+    """Extract the thinking text from a non-streaming chat-completions message (dict or SDK object)."""
+    if not message:
+        return None
+    if isinstance(message, Mapping):
+        return _first_reasoning_field(message)
+    for key in _LOCAL_REASONING_FIELD_KEYS:
+        value = getattr(message, key, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _first_reasoning_field(mapping: Mapping[str, Any] | None) -> str | None:
+    if not mapping:
+        return None
+    for key in _LOCAL_REASONING_FIELD_KEYS:
+        value = mapping.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def install_local_reasoning_patch() -> None:
+    """Capture local-LLM ``reasoning_content`` so its thinking renders in the dashboard.
+
+    The base ``ChatOpenAI`` deliberately drops provider-specific fields such as
+    ``reasoning_content`` (documented at the top of its ``base.py``). For
+    ``local:`` models — Qwen/vLLM/DashScope — the thinking tokens are therefore
+    discarded before they reach ``AIMessageChunk.content_blocks``, so the v3
+    streaming bridge never emits ``reasoning-delta`` events and the dashboard
+    shows only tool calls plus the final answer.
+
+    The patch does two things for local-model chunks only (see
+    ``_LOCAL_REASONING_MARKER``):
+
+    * store each chunk's thinking slice (``delta.reasoning_content`` or
+      ``delta.reasoning``) in ``additional_kwargs["reasoning_content"]``; and
+    * relabel ``response_metadata["model_provider"]`` so ``content_blocks``
+      resolves to a reasoning-content-aware translator instead of the OpenAI one
+      that silently drops the field.
+
+    The same capture is applied to the non-streaming result path
+    (``_create_chat_result``): the agent factory invokes models via
+    ``ainvoke`` and the compat bridge reconstructs the ``message-start``
+    event — including its provider label and the ``additional_kwargs``
+    that carry the accumulated thinking — from the final message.
+
+    Everything downstream — the v3 ``reasoning-delta`` events, the client
+    ``MessageAssembler`` reasoning blocks, and the ``ReasoningBlock`` renderer —
+    already handles standard reasoning blocks, so this is the single missing
+    link. Mirrors what the DeepSeek partner does natively.
+    """
+    global _local_reasoning_installed
+    if _local_reasoning_installed:
+        return
+    try:
+        from langchain_openai.chat_models import base as lo_base
+    except ImportError:
+        return
+    if getattr(lo_base, "_open_swe_reasoning_patched", False):
+        _local_reasoning_installed = True
+        return
+
+    original_convert = lo_base.BaseChatOpenAI._convert_chunk_to_generation_chunk
+    original_result = lo_base.BaseChatOpenAI._create_chat_result
+
+    def _patched_convert(self: Any, chunk: Mapping[str, Any], *args: Any) -> Any:
+        generation_chunk = original_convert(self, chunk, *args)
+        if (
+            generation_chunk is None
+            or not isinstance(generation_chunk.message, lo_base.AIMessageChunk)
+            or not getattr(self, _LOCAL_REASONING_MARKER, False)
+        ):
+            return generation_chunk
+        message = generation_chunk.message
+        message.response_metadata[_LOCAL_REASONING_MODEL_PROVIDER_KEY] = (
+            _LOCAL_REASONING_MODEL_PROVIDER
+        )
+        if (reasoning := _delta_reasoning_text(chunk)) is not None:
+            message.additional_kwargs["reasoning_content"] = reasoning
+        return generation_chunk
+
+    def _patched_create_chat_result(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original_result(self, *args, **kwargs)
+        if not getattr(self, _LOCAL_REASONING_MARKER, False):
+            return result
+        response = args[0] if args else kwargs.get("response")
+        reasoning: str | None = None
+        model_name: str | None = None
+        choices: Any = None
+        if isinstance(response, Mapping):
+            choices = response.get("choices")
+            if (model := response.get("model")) is not None:
+                model_name = str(model)
+        else:
+            choices = getattr(response, "choices", None)
+            model_name = getattr(response, "model", None)
+        if isinstance(choices, list) and choices:
+            choice = choices[0]
+            if isinstance(choice, Mapping):
+                reasoning = _message_reasoning_text(choice.get("message"))
+            else:
+                reasoning = _message_reasoning_text(getattr(choice, "message", None))
+        for generation in result.generations:
+            message = generation.message
+            message.response_metadata[_LOCAL_REASONING_MODEL_PROVIDER_KEY] = (
+                _LOCAL_REASONING_MODEL_PROVIDER
+            )
+            if isinstance(model_name, str):
+                message.response_metadata.setdefault("model_name", model_name)
+            if reasoning is not None:
+                message.additional_kwargs["reasoning_content"] = reasoning
+        return result
+
+    lo_base.BaseChatOpenAI._convert_chunk_to_generation_chunk = _patched_convert  # type: ignore[method-assign]
+    lo_base.BaseChatOpenAI._create_chat_result = _patched_create_chat_result  # type: ignore[method-assign]
+    lo_base._open_swe_reasoning_patched = True
+    _local_reasoning_installed = True
 
 
 def _coerce_openai_chat_completions_kwargs(model_kwargs: dict[str, object]) -> None:
@@ -121,18 +438,69 @@ def _configure_openai_responses_kwargs(model_kwargs: dict[str, object]) -> None:
         include.append("reasoning.encrypted_content")
 
 
-def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpack[ModelKwargs]):
+async def make_model(
+    model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpack[ModelKwargs]
+) -> BaseChatModel:
     """Build a chat model, optionally routed through the LangSmith LLM Gateway.
 
     ``use_gateway`` resolves the deployment default (``LANGSMITH_GATEWAY_ENABLED``)
     when ``None``; async callers pass the team-settings-resolved value. When on,
     gateway ``base_url``/``api_key``/``use_responses_api`` override the direct
-    provider defaults below (see :mod:`agent.utils.gateway`).
+    provider defaults below (see :mod:`agent.utils.gateway``). This is a coroutine:
+    the ``local:`` branch performs an async ``/models`` read (model construction
+    happens inside the run's event loop, where blocking sockets are rejected by
+    langgraph's blockbuster guard), so callers must ``await`` it.
     """
     model_kwargs: dict[str, object] = dict(kwargs)
     model_kwargs.setdefault("max_retries", DEFAULT_MAX_RETRIES)
     if model_id.startswith(_TIMEOUT_PROVIDER_PREFIXES):
         model_kwargs.setdefault("timeout", DEFAULT_REQUEST_TIMEOUT_SECONDS)
+    # The local: branch below returns early, so install the overflow patch here
+    # rather than at the shared tail; it is idempotent and cheap.
+    install_context_overflow_error_patch()
+
+    if model_id.startswith("local:"):
+        model_name = model_id.split(":", 1)[1]
+        model_kwargs["model_provider"] = "openai"
+        model_kwargs["base_url"] = os.environ.get("LOCAL_LLM_BASE_URL", "http://localhost:8080/v1")
+        model_kwargs["api_key"] = os.environ.get("LOCAL_LLM_API_KEY", "dummy")
+        model_kwargs.pop("use_responses_api", None)
+        model_kwargs.pop("reasoning", None)
+        model_kwargs.pop("thinking", None)
+        model_kwargs.pop("effort", None)
+
+        # 👈 【新增以下逻辑】：注入 Qwen/DashScope/vLLM 的思考开关
+        extra_body = dict(model_kwargs.get("extra_body") or {})
+        # 从环境变量或者默认开启思考模式
+        enable_thinking = os.environ.get("LOCAL_LLM_ENABLE_THINKING", "true").lower() in (
+            "true",
+            "1",
+        )
+        if enable_thinking:
+            extra_body["enable_thinking"] = True
+            # 如果是本地 vLLM，部分框架使用 chat_template_kwargs
+            extra_body.setdefault("chat_template_kwargs", {"enable_thinking": True})
+
+        if extra_body:
+            model_kwargs["extra_body"] = extra_body
+
+        install_local_reasoning_patch()
+
+        local_profile = await _local_llm_model_profile(
+            model_name, model_kwargs["base_url"], model_kwargs.get("max_tokens")
+        )
+        if local_profile:
+            model_kwargs["profile"] = local_profile
+        local_model = init_chat_model(model=model_name, **model_kwargs)
+        # Mark the instance so the reasoning patch only relabels/captures
+        # chunks from local models, leaving other chat-completions models
+        # alone. Unsettable markers (test doubles, proxies) are harmless:
+        # the patch no-ops on instances that carry no marker.
+        try:
+            local_model._open_swe_local_reasoning = True  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass
+        return local_model
 
     if model_id.startswith("openai:"):
         model_kwargs["base_url"] = (
@@ -320,6 +688,11 @@ def provider_model_kwargs(
         effort = fireworks_reasoning_effort_for(profile_effort)
         if effort is not None:
             kwargs["model_kwargs"] = {"reasoning_effort": effort}
+    # 👈 【新增此分支】：处理本地/Qwen 模型的思考开关
+    elif model_id.startswith("local:"):
+        # 只要 profile 没有显式设为 "none"，就打开思考
+        if profile_effort != "none":
+            kwargs["extra_body"] = {"enable_thinking": True}
     return kwargs
 
 
