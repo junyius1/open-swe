@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 from types import SimpleNamespace
@@ -1244,6 +1245,14 @@ async def test_run_cancel_enforces_thread_ownership(monkeypatch) -> None:
     assert exc_info.value.status_code == 404
 
 
+@pytest.fixture(autouse=True)
+def _reset_history_proxy_shared_state():
+    thread_api._HISTORY_COALESCING.clear()
+    thread_api._FALLBACK_LOCKS.clear()
+    thread_api._FALLBACK_SNAPSHOT_CACHE.clear()
+    yield
+
+
 async def test_read_endpoints_accessible_by_non_owner(monkeypatch) -> None:
     """Read endpoints (state, stream, history) are accessible by any org member."""
 
@@ -1307,6 +1316,144 @@ async def test_read_endpoints_accessible_by_non_owner(monkeypatch) -> None:
     with pytest.raises(HTTPException) as exc_info:
         await thread_api.proxy_dashboard_thread_history("tid", "teammate", b"\xff")
     assert exc_info.value.status_code == 400
+
+
+async def test_history_proxy_coalesces_concurrent_identical_requests(monkeypatch) -> None:
+    """Concurrent identical history requests must issue a single runtime call."""
+
+    class FakeThreads:
+        async def get(self, thread_id: str) -> dict[str, object]:
+            return {
+                "thread_id": "tid",
+                "metadata": {"source": "slack", "github_login": "owner"},
+            }
+
+    class FakeClient:
+        threads = FakeThreads()
+
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: FakeClient())
+
+    upstream_posts: list[dict[str, object]] = []
+    release_upstream = asyncio.Event()
+    history_body = b"[{latest}]"
+
+    class CoalesceClient:
+        def __init__(self, *a: object, **kw: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "CoalesceClient":
+            return self
+
+        async def __aexit__(self, *a: object) -> None:
+            pass
+
+        async def post(self, *a: object, **kw: object):
+            upstream_posts.append(kw["json"])
+            await release_upstream.wait()
+            return SimpleNamespace(
+                status_code=200,
+                content=history_body,
+                headers={"content-type": "application/json"},
+            )
+
+        async def get(self, *a: object, **kw: object) -> None:
+            raise AssertionError("get should not be called")
+
+    monkeypatch.setattr(thread_api.httpx, "AsyncClient", CoalesceClient)
+
+    async def run_both() -> object:
+        return await asyncio.gather(
+            thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 20}'),
+            thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 20}'),
+        )
+
+    task = asyncio.create_task(run_both())
+    try:
+        await asyncio.sleep(0.2)
+        release_upstream.set()
+        results = await task
+    finally:
+        release_upstream.set()
+    assert results == [(200, history_body, "application/json")] * 2
+    assert len(upstream_posts) == 1
+    assert upstream_posts[0] == {"limit": thread_api._DISCOVERY_HISTORY_LIMIT}
+    assert thread_api._HISTORY_COALESCING == {}
+
+
+async def test_history_fallback_serializes_concurrent_duplicates(monkeypatch) -> None:
+    """Concurrent history timeouts share one serialized fallback, not N parallel ones."""
+
+    class FakeThreads:
+        async def get(self, thread_id: str) -> dict[str, object]:
+            return {
+                "thread_id": "tid",
+                "metadata": {"source": "slack", "github_login": "owner"},
+            }
+
+    class FakeClient:
+        threads = FakeThreads()
+
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: FakeClient())
+
+    head_calls: list[str] = []
+    state_body = json.dumps(
+        [
+            {
+                "values": {},
+                "next": [],
+                "tasks": [],
+                "metadata": {},
+                "created_at": "t",
+                "checkpoint": {},
+                "parent_checkpoint": {},
+                "interrupts": [],
+                "checkpoint_id": "ck1",
+                "parent_checkpoint_id": "ck0",
+            }
+        ]
+    ).encode("utf-8")
+
+    class FallbackClient:
+        def __init__(self, *a: object, **kw: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "FallbackClient":
+            return self
+
+        async def __aexit__(self, *a: object) -> None:
+            pass
+
+        async def post(self, *a: object, **kw: object):
+            if kw.get("json") == {"limit": 1}:
+                head_calls.append("limit1")
+                await asyncio.sleep(0.05)
+                return SimpleNamespace(
+                    status_code=200,
+                    content=state_body,
+                    headers={"content-type": "application/json"},
+                )
+            raise httpx.ReadTimeout("read timed out")
+
+        async def get(self, *a: object, **kw: object):
+            head_calls.append("state")
+            await asyncio.sleep(0.05)
+            return SimpleNamespace(
+                status_code=200,
+                content=state_body,
+                headers={"content-type": "application/json"},
+            )
+
+    monkeypatch.setattr(thread_api.httpx, "AsyncClient", FallbackClient)
+    monkeypatch.setattr(thread_api, "_FALLBACK_RETRY_BASE_DELAY", 0.01)
+    results = await asyncio.gather(
+        thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 20}'),
+        thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 20}'),
+    )
+    assert results == [(200, state_body, "application/json")] * 2
+    # The fallback limit=1 head read runs once for both callers: the per-thread
+    # fallback lock serializes them.
+    assert head_calls.count("limit1") == 1
+    assert thread_api._HISTORY_COALESCING == {}
 
 
 async def test_history_proxy_maps_upstream_errors_to_http(monkeypatch) -> None:
@@ -1413,6 +1560,7 @@ async def test_history_proxy_maps_upstream_errors_to_http(monkeypatch) -> None:
         ),
     )
     del seen_timeouts[:]
+    thread_api._FALLBACK_SNAPSHOT_CACHE.clear()
     with pytest.raises(HTTPException) as exc_info:
         await thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 1000}')
     assert exc_info.value.status_code == 503
