@@ -2138,8 +2138,34 @@ async def get_dashboard_thread_state(
     )
     metadata = thread_metadata(thread)
     with phase(record, "get_state"):
-        state = await client.threads.get_state(thread_id)
-    result = as_json_object(state)
+        try:
+            state = await asyncio.wait_for(
+                client.threads.get_state(thread_id),
+                timeout=_GET_STATE_TIMEOUT,
+            )
+        except TimeoutError:
+            # Oversized/long-lived threads can make the runtime's /state stall
+            # (the inmem dev runtime's single loop is busy with the active run's
+            # checkpoint I/O). Degrade to the denormalized state the thread
+            # record already carries instead of 500ing the refresh; the live
+            # stream reconciles the transcript once a run is in flight.
+            logger.warning(
+                "thread state read for %s exceeded %.0fs; "
+                "serving the denormalized thread state instead",
+                thread_id,
+                _GET_STATE_TIMEOUT,
+            )
+            values = thread.get("values")
+            result: dict[str, Any] = {
+                "values": values if isinstance(values, dict) else {},
+                "next": [],
+                "metadata": thread.get("metadata"),
+                "created_at": thread.get("created_at"),
+                "parent_config": None,
+                "tasks": [],
+            }
+        else:
+            result = as_json_object(state)
     # The SDK's `useStream` opens its live event subscription only when the
     # hydrated `getState()` looks active (`next` non-empty / absent). When a
     # run was just started out-of-band (our REST run-create), the latest

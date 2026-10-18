@@ -1629,6 +1629,51 @@ async def test_thread_state_uses_current_run_status_when_checkpoint_is_stale(mon
     assert "next" not in state
 
 
+async def test_thread_state_degrades_to_denormalized_state_on_read_timeout(monkeypatch) -> None:
+    """A stalled runtime /state must not 500 the refresh; serve the
+    denormalized thread state instead."""
+    import asyncio
+
+    monkeypatch.setattr(thread_api, "_GET_STATE_TIMEOUT", 0.01)
+
+    class FakeThreads:
+        async def get(self, thread_id: str) -> dict[str, object]:
+            return {
+                "thread_id": thread_id,
+                "status": "idle",
+                "created_at": "2026-01-01T00:00:00Z",
+                "metadata": {
+                    "source": "dashboard",
+                    "github_login": "owner",
+                    "latest_run_status": "success",
+                },
+                "values": {"messages": [{"id": "m1"}]},
+            }
+
+        async def update(self, **kwargs: object) -> None:
+            pass
+
+        async def get_state(self, thread_id: str) -> dict[str, object]:
+            await asyncio.sleep(1.0)  # simulates the stalled runtime /state
+            return {"values": {"messages": []}, "next": []}
+
+    class FakeRuns:
+        async def list(self, thread_id: str, *, limit: int) -> list[dict[str, str]]:
+            return []
+
+    class FakeClient:
+        threads = FakeThreads()
+        runs = FakeRuns()
+
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: FakeClient())
+
+    state = await thread_api.get_dashboard_thread_state("tid", "owner")
+
+    assert state["values"] == {"messages": [{"id": "m1"}]}
+    assert state["next"] == []
+    assert state["created_at"] == "2026-01-01T00:00:00Z"
+
+
 async def test_read_endpoints_reject_non_surfaced_source(monkeypatch) -> None:
     """Threads with an unknown source are not readable by anyone."""
 
