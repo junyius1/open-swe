@@ -11,6 +11,7 @@ from ..dashboard import router as dashboard_router
 from ..dashboard.plan_api import plan_router
 from ..dashboard.workflow_approval_api import workflow_approval_router
 from ..utils.event_loop import pin_single_event_loop
+from ..utils.queue_debug import QueueDebugMiddleware, enable_from_env
 from ..webhooks.github_routes import router as github_webhook_router
 from ..webhooks.linear_routes import router as linear_webhook_router
 from ..webhooks.slack_routes import router as slack_webhook_router
@@ -37,6 +38,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     app = FastAPI(lifespan=lifespan)
+    app.add_middleware(QueueDebugMiddleware)
+    enable_from_env()
     allowed_origins = [
         origin.strip()
         for origin in os.environ.get("DASHBOARD_ALLOWED_ORIGINS", "").split(",")
@@ -49,10 +52,10 @@ def create_app() -> FastAPI:
     if allowed_origins:
         app.add_middleware(
             CORSMiddleware,
-            #allow_origins=allowed_origins,
+            # allow_origins=allowed_origins,
             allow_origins=["*"],  # 强行允许所有来源！
             allow_credentials=True,
-            #allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            # allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             allow_methods=["*"],  # 允许所有方法包括 OPTIONS 预检！
             allow_headers=["*"],
         )
