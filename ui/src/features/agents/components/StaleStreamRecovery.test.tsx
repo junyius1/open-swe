@@ -35,6 +35,7 @@ beforeEach(() => {
   vi.useFakeTimers()
   mocks.controller.hydrate.mockClear()
   mocks.controller.stop.mockClear()
+  mocks.getThread.mockClear()
   mocks.getThread.mockResolvedValue({ status: "idle" })
   mocks.stream.isLoading = true
 })
@@ -45,6 +46,21 @@ afterEach(() => {
 })
 
 describe("StaleStreamRecovery", () => {
+  it("heals a thread that is already stuck when the view mounts settled", async () => {
+    render(<StaleStreamRecovery threadId="thread-1" serverRunning={false} />)
+
+    await act(async () => {
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(1000)
+    })
+
+    expect(mocks.getThread).toHaveBeenCalledWith("thread-1", { markViewed: false })
+    expect(mocks.controller.stop).toHaveBeenCalledTimes(1)
+    expect(mocks.controller.stop).toHaveBeenCalledWith({ cancel: false })
+    expect(mocks.controller.hydrate).toHaveBeenCalledTimes(1)
+    expect(mocks.controller.hydrate).toHaveBeenCalledWith("thread-1")
+  })
+
   it("re-hydrates once when the polled status settles while the stream is still loading", async () => {
     const view = render(
       <StaleStreamRecovery threadId="thread-1" serverRunning={true} />
@@ -56,7 +72,7 @@ describe("StaleStreamRecovery", () => {
 
     await act(async () => {
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(300)
+      await vi.advanceTimersByTimeAsync(1000)
     })
 
     expect(mocks.controller.stop).toHaveBeenCalledTimes(1)
@@ -92,72 +108,67 @@ describe("StaleStreamRecovery", () => {
     )
 
     await act(async () => {
-      await vi.runAllTimersAsync()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(4000)
     })
 
     expect(mocks.controller.stop).not.toHaveBeenCalled()
     expect(mocks.controller.hydrate).not.toHaveBeenCalled()
+    expect(mocks.getThread).toHaveBeenCalledTimes(2)
   })
 
-  it("skips recovery when the fresh status check fails", async () => {
+  it("retries later when the confirmation fetch fails", async () => {
     mocks.getThread.mockRejectedValue(new Error("network"))
-    const view = render(
-      <StaleStreamRecovery threadId="thread-1" serverRunning={true} />
-    )
-    view.rerender(
-      <StaleStreamRecovery threadId="thread-1" serverRunning={false} />
-    )
-
-    await act(async () => {
-      await vi.runAllTimersAsync()
-    })
-
-    expect(mocks.controller.stop).not.toHaveBeenCalled()
-    expect(mocks.controller.hydrate).not.toHaveBeenCalled()
-  })
-
-
-  it("does not re-hydrate on repeated settled renders", async () => {
-    const view = render(
-      <StaleStreamRecovery threadId="thread-1" serverRunning={true} />
-    )
-    view.rerender(
-      <StaleStreamRecovery threadId="thread-1" serverRunning={false} />
-    )
-    view.rerender(
-      <StaleStreamRecovery threadId="thread-1" serverRunning={false} />
-    )
-
-    await act(async () => {
-      await vi.runAllTimersAsync()
-    })
-
-    expect(mocks.controller.hydrate).toHaveBeenCalledTimes(1)
-  })
-
-  it("does not re-hydrate when the stream already settled", async () => {
-    mocks.stream.isLoading = false
-    const view = render(
-      <StaleStreamRecovery threadId="thread-1" serverRunning={true} />
-    )
-    view.rerender(
-      <StaleStreamRecovery threadId="thread-1" serverRunning={false} />
-    )
-
-    await act(async () => {
-      await vi.runAllTimersAsync()
-    })
-
-    expect(mocks.controller.hydrate).not.toHaveBeenCalled()
-  })
-
-  it("does not re-hydrate for a thread that was never running", async () => {
     render(<StaleStreamRecovery threadId="thread-1" serverRunning={false} />)
 
     await act(async () => {
-      await vi.runAllTimersAsync()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(4000)
     })
 
+    expect(mocks.controller.stop).not.toHaveBeenCalled()
     expect(mocks.controller.hydrate).not.toHaveBeenCalled()
+    expect(mocks.getThread).toHaveBeenCalledTimes(2)
+  })
+
+  it("uses a provided confirmRunning check instead of the cloud fetch", async () => {
+    const confirmRunning = vi.fn().mockResolvedValue(false)
+    render(
+      <StaleStreamRecovery
+        threadId="thread-1"
+        serverRunning={false}
+        confirmRunning={confirmRunning}
+      />
+    )
+
+    await act(async () => {
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(1000)
+    })
+
+    expect(mocks.getThread).not.toHaveBeenCalled()
+    expect(confirmRunning).toHaveBeenCalledTimes(1)
+    expect(mocks.controller.stop).toHaveBeenCalledTimes(1)
+    expect(mocks.controller.hydrate).toHaveBeenCalledWith("thread-1")
+  })
+
+  it("stands down while confirmRunning reports the run is live", async () => {
+    const confirmRunning = vi.fn().mockResolvedValue(true)
+    render(
+      <StaleStreamRecovery
+        threadId="thread-1"
+        serverRunning={false}
+        confirmRunning={confirmRunning}
+      />
+    )
+
+    await act(async () => {
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(4000)
+    })
+
+    expect(mocks.controller.stop).not.toHaveBeenCalled()
+    expect(mocks.controller.hydrate).not.toHaveBeenCalled()
+    expect(confirmRunning).toHaveBeenCalledTimes(2)
   })
 })

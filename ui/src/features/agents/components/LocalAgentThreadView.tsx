@@ -148,6 +148,11 @@ export function LocalAgentThreadView({ sessionId }: { sessionId: string }) {
   )
 
   const activity = useLocalThreadActivity()[sessionId]
+  const confirmLocalThreadRunning = useCallback(async () => {
+    const details = await window.openSweDesktop?.getLocalThread(sessionId)
+    const liveActivity = await window.openSweDesktop?.localActivity()
+    return Boolean(details?.pending) || liveActivity?.[sessionId] === "running"
+  }, [sessionId])
   const isRunning =
     stream.isLoading ||
     (Boolean(thread?.pending) && !error) ||
@@ -351,6 +356,7 @@ export function LocalAgentThreadView({ sessionId }: { sessionId: string }) {
       <StaleStreamRecovery
         threadId={sessionId}
         serverRunning={Boolean(thread?.pending) || activity === "running"}
+        confirmRunning={confirmLocalThreadRunning}
       />
       <div
         className="flex min-w-0 flex-1 flex-col"
