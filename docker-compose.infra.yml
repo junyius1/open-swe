@@ -1,0 +1,45 @@
+# Local Postgres + Redis for Open SWE persistence (dev and single-container prod).
+#
+#   docker compose -f docker-compose.infra.yml up -d
+#
+# Dev server: set DATABASE_URI in .env (see docs/INSTALLATION.md) - the dev
+# server picks it up via agent/postgres_persistence.py (thread state + long-term
+# memory). Prod: the same two services feed DATABASE_URI / REDIS_URI of the
+# standalone Docker server (redis backs the background-job queue there).
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: oswe-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - oswe_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: oswe-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - oswe_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  oswe_pg_data:
+  oswe_redis_data:

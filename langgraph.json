@@ -16,11 +16,15 @@
     "app": "agent.webapp:app"
   },
   "checkpointer": {
+    "path": "agent/postgres_persistence.py:create_checkpointer",
     "ttl": {
       "strategy": "delete",
       "sweep_interval_minutes": 60,
       "default_ttl": 43200
     }
+  },
+  "store": {
+    "path": "agent/postgres_persistence.py:create_store"
   },
   "env": ".env"
 }
