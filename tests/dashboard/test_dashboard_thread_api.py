@@ -10,7 +10,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from agent.dashboard import routes, thread_api
+from agent.dashboard import routes, state_cache, thread_api
 from agent.dashboard.agent_overrides import resolve_agent_model_id
 from agent.dashboard.options import model_supports_images
 from agent.dashboard.ttft import AssistantTextObservation
@@ -1250,6 +1250,7 @@ def _reset_history_proxy_shared_state():
     thread_api._HISTORY_COALESCING.clear()
     thread_api._FALLBACK_LOCKS.clear()
     thread_api._FALLBACK_SNAPSHOT_CACHE.clear()
+    thread_api.state_cache.clear()
     yield
 
 
@@ -2993,3 +2994,211 @@ def test_admin_cancel_thread_dependency_rejects_non_admin(monkeypatch) -> None:
         routes._require_admin({"sub": "not-admin", "email": "user@example.com"})
 
     assert exc_info.value.status_code == 403
+
+
+class _CachedStateThreads:
+    def __init__(self, thread: dict[str, object], state: dict[str, object]) -> None:
+        self.thread = thread
+        self.state = state
+        self.get_state_calls = 0
+
+    async def get(self, thread_id: str) -> dict[str, object]:
+        return self.thread
+
+    async def update(self, **kwargs: object) -> None:
+        pass
+
+    async def get_state(self, thread_id: str) -> dict[str, object]:
+        self.get_state_calls += 1
+        return self.state
+
+
+class _CachedStateClient:
+    def __init__(self, threads: _CachedStateThreads) -> None:
+        self.threads = threads
+        self.runs_list_calls = 0
+
+    async def _no_runs(self, thread_id: str, *, limit: int) -> list[dict[str, str]]:
+        self.runs_list_calls += 1
+        return []
+
+    runs: object
+
+
+async def test_state_cache_hit_serves_memory_without_runtime_read(monkeypatch) -> None:
+    """A second idle /state read must hit the in-process cache and not
+    queue a read on the runtime (no get_state call, no runs list)."""
+    threads = _CachedStateThreads(
+        {
+            "thread_id": "tid",
+            "status": "idle",
+            "state_updated_at": "v1",
+            "metadata": {"source": "dashboard", "github_login": "owner"},
+        },
+        {"values": {"messages": [{"id": "m1"}]}, "next": []},
+    )
+    client = _CachedStateClient(threads)
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: client)
+
+    first = await thread_api.get_dashboard_thread_state("tid", "owner")
+    assert first["values"] == {"messages": [{"id": "m1"}]}
+    assert threads.get_state_calls == 1
+
+    stats_before = state_cache.stats()
+    assert stats_before["hits"] == 0 and stats_before["misses"] == 1
+    second = await thread_api.get_dashboard_thread_state("tid", "owner")
+    assert second["values"] == {"messages": [{"id": "m1"}]}
+    assert threads.get_state_calls == 1
+    stats_after = state_cache.stats()
+    assert stats_after["hits"] == stats_before["hits"] + 1
+
+
+async def test_state_cache_miss_on_new_state_version(monkeypatch) -> None:
+    """When the thread record's state version moves, the entry stops
+    matching and the next read goes to the runtime."""
+    threads = _CachedStateThreads(
+        {
+            "thread_id": "tid",
+            "status": "idle",
+            "state_updated_at": "v1",
+            "metadata": {"source": "dashboard", "github_login": "owner"},
+        },
+        {"values": {"messages": [{"id": "m1"}]}, "next": []},
+    )
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: _CachedStateClient(threads))
+
+    await thread_api.get_dashboard_thread_state("tid", "owner")
+    threads.thread = {**threads.thread, "state_updated_at": "v2"}
+    threads.state = {"values": {"messages": [{"id": "m2"}]}, "next": []}
+
+    second = await thread_api.get_dashboard_thread_state("tid", "owner")
+    assert second["values"] == {"messages": [{"id": "m2"}]}
+    assert threads.get_state_calls == 2
+    assert state_cache.stats()["misses"] == 2
+
+
+async def test_state_cache_skipped_while_run_in_flight(monkeypatch) -> None:
+    """A pending/running latest run must bypass the cache and keep
+    dropping `next` for the SDK."""
+    threads = _CachedStateThreads(
+        {
+            "thread_id": "tid",
+            "status": "busy",
+            "state_updated_at": "v1",
+            "metadata": {
+                "source": "dashboard",
+                "github_login": "owner",
+                "latest_run_status": "running",
+            },
+        },
+        {"values": {"messages": []}, "next": ["agent"]},
+    )
+    client = _CachedStateClient(threads)
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: client)
+
+    class FakeRuns:
+        async def list(self, thread_id: str, *, limit: int) -> list[dict[str, str]]:
+            return [{"run_id": "run-1", "status": "running"}]
+
+    client.runs = FakeRuns()
+
+    for _ in range(2):
+        state = await thread_api.get_dashboard_thread_state("tid", "owner")
+        assert "next" not in state
+    assert threads.get_state_calls == 2
+    stats = state_cache.stats()
+    assert stats["hits"] == 0
+    assert stats["invalidations"] >= 1
+
+
+async def test_send_path_prefill_uses_state_cache(monkeypatch) -> None:
+    """The run.start pre-read must hit the cache instead of calling
+    get_state when the thread is idle, and a started run must invalidate."""
+    threads = _CachedStateThreads(
+        {
+            "thread_id": "tid",
+            "status": "idle",
+            "state_updated_at": "v1",
+            "metadata": {
+                "source": "dashboard",
+                "github_login": "owner",
+                "participant_logins": ["owner"],
+            },
+        },
+        {"values": {"messages": [{"id": "m1"}]}, "next": []},
+    )
+    client = _CachedStateClient(threads)
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: client)
+
+    async def fake_get_profile(login: str) -> dict[str, object]:
+        return {}
+
+    async def fake_ensure_token(login: str) -> None:
+        pass
+
+    async def fake_resolve_email(login: str, profile: dict[str, object]) -> str:
+        return f"{login}@example.com"
+
+    monkeypatch.setattr(thread_api, "get_profile", fake_get_profile)
+    monkeypatch.setattr(thread_api, "_ensure_dashboard_github_token", fake_ensure_token)
+    monkeypatch.setattr(thread_api, "_resolve_run_email", fake_resolve_email)
+
+    # Prime the cache through the /state endpoint.
+    await thread_api.get_dashboard_thread_state("tid", "owner")
+    assert threads.get_state_calls == 1
+
+    command = {
+        "method": "run.start",
+        "params": {"input": {"messages": [{"role": "user", "content": "next"}]}},
+    }
+    await thread_api._enrich_run_start_command(
+        "tid",
+        "owner",
+        command,
+        metadata=thread_api.thread_metadata(threads.thread),
+        thread=threads.thread,
+        email="owner@example.com",
+    )
+    # Pre-read came from the cache: no second runtime read.
+    assert threads.get_state_calls == 1
+
+    # After a run starts, the cache must be dirty so the next /state read
+    # goes to the runtime.
+    state_cache.invalidate("tid")
+    await thread_api.get_dashboard_thread_state("tid", "owner")
+    assert threads.get_state_calls == 2
+
+
+def test_state_cache_eviction_and_tombstone() -> None:
+    import os
+
+    original = os.environ.get("DASHBOARD_STATE_CACHE_MAX_ENTRIES")
+    os.environ["DASHBOARD_STATE_CACHE_MAX_ENTRIES"] = "2"
+    try:
+        state_cache._MAX_ENTRIES = 2
+        state_cache.clear()
+        state_cache.put("a", "v1", {"values": {}})
+        state_cache.put("b", "v1", {"values": {}})
+        state_cache.put("c", "v1", {"values": {}})
+        assert state_cache.get("a", "v1") is None
+        assert state_cache.get("b", "v1") is not None
+        assert state_cache.get("c", "v1") is not None
+
+        state_cache.invalidate("b")  # fresh entry dropped
+        assert state_cache.get("b", "v1") is None
+        state_cache.invalidate("zz")  # unknown thread -> tombstone (separate key)
+        assert state_cache.get("zz", "v1") is None
+        assert state_cache.stats()["entries"] == 2
+    finally:
+        state_cache._MAX_ENTRIES = int(original or "256")
+        state_cache.clear()
+        if original is not None:
+            os.environ["DASHBOARD_STATE_CACHE_MAX_ENTRIES"] = original
+
+
+def test_state_cache_version_parsing() -> None:
+    assert state_cache.parse_state_updated_at("2026-01-01T00:00:00Z") == "2026-01-01T00:00:00Z"
+    assert state_cache.parse_state_updated_at(None) is None
+    assert state_cache.parse_state_updated_at("") is None
+    parsed = state_cache.parse_state_updated_at(1767225600)
+    assert isinstance(parsed, str) and parsed.endswith("+00:00")
