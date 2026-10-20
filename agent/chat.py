@@ -51,6 +51,7 @@ from .middleware import (
     SanitizeOpenAIResponsesMiddleware,
     SanitizeThinkingBlocksMiddleware,
     SanitizeToolInputsMiddleware,
+    StripThoughtsMiddleware,
     ToolErrorMiddleware,
 )
 from .middleware.prepare_run import PrepareRunState
@@ -96,6 +97,7 @@ def _chat_general_purpose_subagent() -> SubAgent:
             [
                 FilesystemMiddleware(tools=["read_file", "ls", "glob", "grep"]),
                 SanitizeOpenAIResponsesMiddleware(),
+                StripThoughtsMiddleware(),
                 ModelCallTimeoutMiddleware(),
             ],
         ),
@@ -257,6 +259,7 @@ async def get_chat_agent(config: RunnableConfig) -> Pregel:
                 SanitizeFireworksMessagesMiddleware(),
                 SanitizeOpenAIResponsesMiddleware(),
                 SanitizeThinkingBlocksMiddleware(),
+                StripThoughtsMiddleware(),
                 ModelCallTimeoutMiddleware(),
             ],
         ),
