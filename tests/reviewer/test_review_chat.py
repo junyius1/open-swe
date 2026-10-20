@@ -629,6 +629,52 @@ async def test_proxy_history_normalizes_missing_thread(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_proxy_history_clamps_unfiltered_limit(monkeypatch) -> None:
+    """Unfiltered history reads must be clamped like the agent-thread proxy."""
+    seen: list[bytes] = []
+
+    async def fake_passthrough(method, thread_id, suffix, body, content_type):
+        assert method == "POST" and suffix == "history"
+        seen.append(body)
+        return 200, b"[]", "application/json"
+
+    async def no_thread(thread_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(review_chat_api, "_proxy_passthrough", fake_passthrough)
+    monkeypatch.setattr(review_chat_api, "_get_chat_thread_metadata", no_thread)
+    await review_chat_api.proxy_review_chat_history(
+        "acme", "repo", 7, "octocat", "ct-1", b'{"limit": 20}'
+    )
+    await review_chat_api.proxy_review_chat_history(
+        "acme", "repo", 7, "octocat", "ct-1", b""
+    )
+    await review_chat_api.proxy_review_chat_history(
+        "acme", "repo", 7, "octocat", "ct-1", b'{"limit": 20, "metadata": {"run_id": "r"}}'
+    )
+    await review_chat_api.proxy_review_chat_history(
+        "acme", "repo", 7, "octocat", "ct-1",
+        b'{"limit": 20, "before": {"checkpoint_ns": "", "checkpoint_id": "c"}}',
+    )
+    assert seen[0] == b'{"limit": 5}'
+    assert seen[1] == b'{"limit": 5}'
+    assert seen[2] == b'{"limit": 20, "metadata": {"run_id": "r"}}'
+    assert seen[3] == (
+        b'{"limit": 20, "before": {"checkpoint_ns": "", "checkpoint_id": "c"}}'
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await review_chat_api.proxy_review_chat_history(
+            "acme", "repo", 7, "octocat", "ct-1", b"not-json"
+        )
+    assert exc_info.value.status_code == 400
+    with pytest.raises(HTTPException) as exc_info:
+        await review_chat_api.proxy_review_chat_history(
+            "acme", "repo", 7, "octocat", "ct-1", b'{"limit": 0}'
+        )
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_proxy_state_rejects_foreign_thread(monkeypatch) -> None:
     async def other_owner(thread_id: str) -> dict[str, Any]:
         return {
