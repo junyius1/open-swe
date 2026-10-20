@@ -37,6 +37,7 @@ from .middleware import (
     PrepareRunState,
     SanitizeOpenAIResponsesMiddleware,
     SanitizeToolInputsMiddleware,
+    StripThoughtsMiddleware,
     TimeoutWrapupMiddleware,
     ToolErrorMiddleware,
 )
@@ -202,6 +203,7 @@ async def get_analyzer(config: RunnableConfig) -> Pregel:
                 ToolErrorMiddleware(),
                 TimeoutWrapupMiddleware(),
                 SanitizeOpenAIResponsesMiddleware(),
+                StripThoughtsMiddleware(),
             ],
         ),
     ).with_config(config)

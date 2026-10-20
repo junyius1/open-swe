@@ -56,6 +56,7 @@ from .middleware import (
     SanitizeThinkingBlocksMiddleware,
     SanitizeToolInputsMiddleware,
     StableToolResultOrderMiddleware,
+    StripThoughtsMiddleware,
     TimeoutWrapupMiddleware,
     ToolErrorMiddleware,
     check_message_queue_before_model,
@@ -363,7 +364,7 @@ def _reviewer_subagent(model: BaseChatModel) -> SubAgent:
         # middleware never wraps their model calls.
         "middleware": cast(
             list[AgentMiddleware[Any, Any, Any]],
-            [SanitizeOpenAIResponsesMiddleware(), ModelCallTimeoutMiddleware()],
+            [SanitizeOpenAIResponsesMiddleware(), StripThoughtsMiddleware(), ModelCallTimeoutMiddleware()],
         ),
     }
 
@@ -1437,6 +1438,7 @@ async def get_reviewer_agent(config: RunnableConfig) -> Pregel:
                 SanitizeFireworksMessagesMiddleware(),
                 SanitizeOpenAIResponsesMiddleware(),
                 SanitizeThinkingBlocksMiddleware(),
+                StripThoughtsMiddleware(),
                 RepairOrphanedToolCallsMiddleware(),
                 StableToolResultOrderMiddleware(),
                 ModelCallTimeoutMiddleware(),

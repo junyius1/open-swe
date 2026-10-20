@@ -23,6 +23,7 @@ _MIDDLEWARE_MODULES = {
     "SanitizeThinkingBlocksMiddleware": ".sanitize_thinking_blocks",
     "SanitizeToolInputsMiddleware": ".sanitize_tool_inputs",
     "StableToolResultOrderMiddleware": ".stable_tool_order",
+    "StripThoughtsMiddleware": ".strip_thoughts",
     "settle_review_check_on_exit": ".settle_review_check",
     "SubdirAgentsReadMiddleware": ".subdir_agents",
     "task_on_failure": ".task_retry",
@@ -48,6 +49,7 @@ __all__ = [
     "SanitizeThinkingBlocksMiddleware",
     "SanitizeToolInputsMiddleware",
     "StableToolResultOrderMiddleware",
+    "StripThoughtsMiddleware",
     "SubdirAgentsReadMiddleware",
     "ToolErrorMiddleware",
     "TimeoutWrapupMiddleware",
@@ -82,6 +84,7 @@ if TYPE_CHECKING:
     from .sanitize_tool_inputs import SanitizeToolInputsMiddleware
     from .settle_review_check import settle_review_check_on_exit
     from .stable_tool_order import StableToolResultOrderMiddleware
+    from .strip_thoughts import StripThoughtsMiddleware
     from .subdir_agents import SubdirAgentsReadMiddleware
     from .task_retry import task_on_failure, task_retry_on
     from .timeout_wrapup import TimeoutWrapupMiddleware
