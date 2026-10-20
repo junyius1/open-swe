@@ -46,6 +46,7 @@ from ..utils.thread_ops import (
 )
 from ..utils.thread_participants import PARTICIPANT_LOGINS_KEY, merge_participant_logins
 from ..utils.timing import phase
+from . import state_cache
 from .admin import is_admin
 from .agent_overrides import normalize_profile_overrides
 from .environments import get_environment, slugify
@@ -162,6 +163,16 @@ def _langgraph_proxy_headers(
 
 def _thread_is_busy(thread: ThreadLike) -> bool:
     return thread.get("status") == "busy"
+
+
+def _thread_state_version(thread: ThreadLike | None) -> str | None:
+    """Runtime state version (``state_updated_at``) used to key the state cache."""
+    if thread is None:
+        return None
+    data = as_json_object(thread)
+    return state_cache.parse_state_updated_at(
+        data.get("state_updated_at") or data.get("updated_at")
+    )
 
 
 async def _resolve_run_email(login: str, profile: dict[str, Any]) -> str | None:
@@ -1598,6 +1609,7 @@ async def _enrich_run_start_command(
     command: dict[str, Any],
     *,
     metadata: dict[str, Any],
+    thread: ThreadLike | None = None,
     thread_busy: bool = False,
     creating: bool = False,
     email: str | None = None,
@@ -1690,13 +1702,23 @@ async def _enrich_run_start_command(
     persisted_message_ids: set[str] = set()
     if not creating:
         try:
-            # Bounded: on oversized threads the state read walks the full
-            # checkpoint history and can stall message submission; on timeout
-            # we proceed without the dedup/context-hash pre-read (degrades
-            # gracefully, mirroring the except branch).
-            prior_state = await asyncio.wait_for(
-                client.threads.get_state(thread_id), timeout=_GET_STATE_TIMEOUT
+            # Idle-thread fast path: a cache hit means the runtime state is
+            # structurally current (run in flight would have invalidated it),
+            # so skip the read that queues on the runtime's single loop.
+            prior_state = (
+                None if thread_busy else state_cache.get(thread_id, _thread_state_version(thread))
             )
+            if prior_state is None:
+                # Bounded: on oversized threads the state read walks the full
+                # checkpoint history and can stall message submission; on
+                # timeout we proceed without the dedup/context-hash pre-read
+                # (degrades gracefully, mirroring the except branch).
+                prior_state = await asyncio.wait_for(
+                    client.threads.get_state(thread_id), timeout=_GET_STATE_TIMEOUT
+                )
+                version = _thread_state_version(thread)
+                if version:
+                    state_cache.put(thread_id, version, as_json_object(prior_state))
             values = prior_state.get("values") if isinstance(prior_state, dict) else None
             if isinstance(values, dict):
                 messages = values.get("messages")
@@ -2029,6 +2051,7 @@ async def delete_dashboard_thread(thread_id: str, login: str, *, email: str | No
             logger.debug("Could not cancel run %s for thread %s", run_id, thread_id, exc_info=True)
 
     await client.threads.delete(thread_id)
+    state_cache.invalidate(thread_id)
 
 
 async def resolve_dashboard_thread(
@@ -2137,47 +2160,68 @@ async def get_dashboard_thread_state(
         client, thread, timings=record
     )
     metadata = thread_metadata(thread)
+    # A run is in flight when the thread is busy or the latest run (live or
+    # denormalized) is still pending/running; that is also the condition
+    # below that drops `next` for the SDK.
+    metadata_run_status = metadata.get("latest_run_status")
+    run_in_flight = (
+        _thread_is_busy(thread)
+        or latest_run_status in {"pending", "running"}
+        or metadata_run_status in {"pending", "running"}
+    )
     with phase(record, "get_state"):
-        try:
-            state = await asyncio.wait_for(
-                client.threads.get_state(thread_id),
-                timeout=_GET_STATE_TIMEOUT,
-            )
-        except TimeoutError:
-            # Oversized/long-lived threads can make the runtime's /state stall
-            # (the inmem dev runtime's single loop is busy with the active run's
-            # checkpoint I/O). Degrade to the denormalized state the thread
-            # record already carries instead of 500ing the refresh; the live
-            # stream reconciles the transcript once a run is in flight.
-            logger.warning(
-                "thread state read for %s exceeded %.0fs; "
-                "serving the denormalized thread state instead",
-                thread_id,
-                _GET_STATE_TIMEOUT,
-            )
-            values = thread.get("values")
-            result: dict[str, Any] = {
-                "values": values if isinstance(values, dict) else {},
-                "next": [],
-                "metadata": thread.get("metadata"),
-                "created_at": thread.get("created_at"),
-                "parent_config": None,
-                "tasks": [],
-            }
+        version = _thread_state_version(thread)
+        cached_state = None if run_in_flight else state_cache.get(thread_id, version)
+        if cached_state is not None:
+            # Idle-thread hit: served from this process's memory without
+            # queuing a read on the runtime's single-worker loop.
+            logger.info("state cache hit thread_id=%s %s", thread_id, state_cache.stats())
+            result = {**cached_state}
         else:
-            result = as_json_object(state)
+            if run_in_flight:
+                state_cache.invalidate(thread_id)
+            else:
+                logger.info("state cache miss thread_id=%s %s", thread_id, state_cache.stats())
+            try:
+                state = await asyncio.wait_for(
+                    client.threads.get_state(thread_id),
+                    timeout=_GET_STATE_TIMEOUT,
+                )
+            except TimeoutError:
+                # Oversized/long-lived threads can make the runtime's /state stall
+                # (the inmem dev runtime's single loop is busy with the active run's
+                # checkpoint I/O). Degrade to the denormalized state the thread
+                # record already carries instead of 500ing the refresh; the live
+                # stream reconciles the transcript once a run is in flight.
+                logger.warning(
+                    "thread state read for %s exceeded %.0fs; "
+                    "serving the denormalized thread state instead",
+                    thread_id,
+                    _GET_STATE_TIMEOUT,
+                )
+                values = thread.get("values")
+                result = {
+                    "values": values if isinstance(values, dict) else {},
+                    "next": [],
+                    "metadata": thread.get("metadata"),
+                    "created_at": thread.get("created_at"),
+                    "parent_config": None,
+                    "tasks": [],
+                }
+            else:
+                result = as_json_object(state)
+            # Cache the resolved payload (live or degraded) for idle threads;
+            # the state version in the thread record changes whenever a run
+            # writes a checkpoint, so a stale entry can never match.
+            if version:
+                state_cache.put(thread_id, version, result)
     # The SDK's `useStream` opens its live event subscription only when the
     # hydrated `getState()` looks active (`next` non-empty / absent). When a
     # run was just started out-of-band (our REST run-create), the latest
     # checkpoint can still be the previous finished one with `next == []`,
     # which the SDK reads as idle and never opens the stream. Drop `next`
     # while a run is pending/running so the SDK treats the thread as active.
-    metadata_run_status = metadata.get("latest_run_status")
-    if (
-        _thread_is_busy(thread)
-        or latest_run_status in {"pending", "running"}
-        or metadata_run_status in {"pending", "running"}
-    ):
+    if run_in_flight:
         result.pop("next", None)
     return result
 
@@ -2663,6 +2707,7 @@ async def proxy_dashboard_thread_commands(
         login,
         parsed,
         metadata=metadata,
+        thread=thread,
         thread_busy=thread_busy,
         creating=creating,
         email=email,
@@ -2728,6 +2773,7 @@ async def proxy_dashboard_thread_commands(
                 thread_id,
                 exc_info=True,
             )
+        state_cache.invalidate(thread_id)
     media_type = response.headers.get("content-type")
     return response.status_code, response.content, media_type
 
