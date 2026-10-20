@@ -26,6 +26,7 @@ inspect):
 import asyncio
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -81,6 +82,12 @@ def _safe_headers(headers: tuple[tuple[str, str], ...]) -> list[tuple[str, str]]
 
 PROBE_ENV = "OPEN_SWE_QUEUE_DEBUG"
 _TRUTHY = {"1", "true", "yes", "on"}
+# Matches the dashboard stream/events proxy path so the probe can
+# count live upstream subscriptions per thread.
+_STREAM_EVENTS_RE = re.compile(r"/threads/([^/]+)/stream/events$")
+# Cap on the per-thread peak table so a long-lived process does not
+# accumulate a key for every distinct thread it ever served.
+_STREAM_EVENTS_PEAK_LIMIT = 1000
 _SAMPLE_SECONDS = 1.0
 # The lag probe schedules a callback this far out and measures how late the
 # loop actually ran it: a direct starvation gauge that works on both the
@@ -98,6 +105,7 @@ _STATE: dict[str, Any] = {
     "stop_event": None,
     "inflight": {},
     "sample_count": 0,
+    "stream_events_peak": {},
     "last_ready_peak": 0,
     "last_loop_tick": None,
 }
@@ -155,7 +163,34 @@ def snapshot(max_requests: int = 50) -> dict[str, Any]:
         "loop_ready_peak": _STATE["last_ready_peak"],
         "lag_ms": _tick_lag_ms(),
         "requests": entries[:max_requests],
+        "stream_events": _stream_events_by_thread(now),
     }
+
+
+def _stream_events_by_thread(now: float) -> dict[str, dict[str, Any]]:
+    """Aggregate live ``/threads/{id}/stream/events`` subscriptions.
+
+    Maps thread_id -> ``{"count": int, "oldest_seconds": float}`` for
+    the in-flight requests whose path matches the stream/events proxy.
+    An ever-growing count for a single thread is the direct signal of
+    orphaned upstream subscriptions (each reconnect that the proxy
+    never recycles adds one)."""
+    out: dict[str, dict[str, Any]] = {}
+    for req in list(_STATE["inflight"].values()):
+        if req.method != "POST":
+            continue
+        match = _STREAM_EVENTS_RE.search(req.path)
+        if not match:
+            continue
+        thread_id = match.group(1)
+        age = now - req.started
+        entry = out.get(thread_id)
+        if entry is None:
+            out[thread_id] = {"count": 1, "oldest_seconds": age}
+        else:
+            entry["count"] += 1
+            entry["oldest_seconds"] = max(entry["oldest_seconds"], age)
+    return out
 
 
 def _loop_ready_len(loop: asyncio.AbstractEventLoop) -> int:
@@ -232,6 +267,48 @@ def _report(now: float, ready: int, lag: int) -> None:
         )
     if n > _HEADER_LIMIT:
         logger.info("queue-probe   ... %d more in flight (no headers)", n - _HEADER_LIMIT)
+    _log_stream_events(now)
+
+
+def _log_stream_events(now: float) -> None:
+    """Log one line summarising live stream/events subscriptions.
+
+    A per-thread ``count`` that keeps climbing (or a high ``peak``)
+    with no matching disconnects indicates the proxy is failing to
+    recycle its upstream subscription -- the orphaned-subscription bug.
+    """
+    per_thread = _stream_events_by_thread(now)
+    if not per_thread:
+        return
+    # Track per-thread peak counts so a burst of reconnects is visible
+    # even when the next sample happens to catch few of them live.
+    peaks = _STATE["stream_events_peak"]
+    for thread_id, entry in per_thread.items():
+        prev = peaks.get(thread_id, 0)
+        peaks[thread_id] = max(prev, entry["count"])
+    # Cap the peak table so a long-lived process does not grow it
+    # without bound (one key per distinct thread ever served). When the
+    # cap is exceeded, keep the highest-count entries (a buffer under
+    # the limit) and drop the rest.
+    if len(peaks) > _STREAM_EVENTS_PEAK_LIMIT:
+        keep = sorted(peaks.items(), key=lambda kv: kv[1], reverse=True)[
+            : _STREAM_EVENTS_PEAK_LIMIT // 2
+        ]
+        _STATE["stream_events_peak"] = dict(keep)
+    total = sum(e["count"] for e in per_thread.values())
+    top = sorted(per_thread.items(), key=lambda kv: (-kv[1]["count"], -kv[1]["oldest_seconds"]))[:8]
+    bits = []
+    for thread_id, entry in top:
+        bits.append(
+            f"{thread_id[:8]}={entry['count']}(peak {peaks.get(thread_id, entry['count'])}, "
+            f"oldest {entry['oldest_seconds']:.1f}s)"
+        )
+    logger.info(
+        "queue-probe stream/events: %d sub(s) across %d thread(s) | %s",
+        total,
+        len(per_thread),
+        " ".join(bits),
+    )
 
 
 def _monitor_run(stop: threading.Event, loop: asyncio.AbstractEventLoop) -> None:

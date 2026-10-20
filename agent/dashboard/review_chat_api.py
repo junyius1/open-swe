@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 from fastapi import HTTPException
+from starlette.types import Receive
 
 from ..review.diff import fetch_pr_diff
 from ..review.findings import REVIEWER_THREAD_KIND
@@ -485,10 +486,11 @@ async def proxy_review_chat_stream_events(
     body: bytes,
     *,
     content_type: str = "application/json",
+    receive: Receive | None = None,
 ) -> AsyncIterator[bytes]:
     await assert_chat_thread_access(thread_id, owner, repo, pr_number, login)
     _require_json_content_type(content_type)
-    return _stream_thread_events(thread_id, body, content_type)
+    return _stream_thread_events(thread_id, body, content_type, receive=receive)
 
 
 async def _proxy_passthrough(

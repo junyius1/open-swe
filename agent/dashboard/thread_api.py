@@ -3,10 +3,12 @@
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import logging
 import os
 import posixpath
+import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
@@ -16,6 +18,7 @@ import httpx
 from fastapi import HTTPException
 from langchain_core.messages.content import ImageContentBlock, create_image_block
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.types import Receive
 
 from ..dispatch import dispatch_agent_run
 from ..input_messages import (
@@ -115,6 +118,14 @@ _FALLBACK_LOCKS: dict[str, asyncio.Lock] = {}
 _FALLBACK_SNAPSHOT_CACHE: dict[str, tuple[float, int, bytes, str | None]] = {}
 _FALLBACK_SNAPSHOT_CACHE_TTL_SECONDS = 30.0
 _PROXY_STREAM_TIMEOUT = httpx.Timeout(None)
+# Lifecycle bounds for the proxied /stream/events subscription.
+_STREAM_IDLE_TIMEOUT_ENV = "OPEN_SWE_STREAM_IDLE_TIMEOUT_SECONDS"
+_STREAM_MAX_LIFETIME_ENV = "OPEN_SWE_STREAM_MAX_LIFETIME_SECONDS"
+_STREAM_IDLE_TIMEOUT_DEFAULT = 60.0
+# The upstream SSE layer emits a ``: ping`` comment every ~15s, so any
+# healthy subscription receives bytes at least that often; 4x that
+# interval catches a silent upstream without recycling a live one.
+_STREAM_MAX_LIFETIME_DEFAULT = 14400.0
 _THREAD_POST_COMMAND_METHODS = frozenset(
     {"run.start", "input.respond", "input.inject", "state.fork"}
 )
@@ -2581,21 +2592,115 @@ async def proxy_dashboard_thread_stream_events(
     *,
     email: str | None = None,
     content_type: str = "application/json",
+    receive: Receive | None = None,
 ) -> AsyncIterator[bytes]:
     # Preflight here (not in the generator) so auth/content-type failures
     # surface as real HTTP errors before the SSE response starts streaming.
     _require_json_content_type(content_type)
     await _readable_thread_metadata(thread_id, login=login, email=email)
-    return _stream_thread_events(thread_id, body, content_type)
+    return _stream_thread_events(thread_id, body, content_type, receive=receive)
+
+
+def _stream_timeout_env(name: str, default: float) -> float:
+    """Read a stream-lifetime bound from the environment at call time.
+
+    Reads (rather than importing) the value lazily so tests can
+    monkeypatch the environment. Unset/empty uses ``default``;
+    ``"0"`` disables the bound (0.0); an unparseable or negative value
+    falls back to ``default``.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return float(default)
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return float(default)
+    if value < 0.0:
+        return float(default)
+    return value
+
+
+def _stream_idle_timeout() -> float:
+    return _stream_timeout_env(_STREAM_IDLE_TIMEOUT_ENV, _STREAM_IDLE_TIMEOUT_DEFAULT)
+
+
+def _stream_max_lifetime() -> float:
+    return _stream_timeout_env(_STREAM_MAX_LIFETIME_ENV, _STREAM_MAX_LIFETIME_DEFAULT)
+
+
+_STREAM_EOF = object()
+
+
+async def _next_chunk(chunks: AsyncIterator[bytes]) -> bytes | object:
+    """Advance the upstream chunk iterator, mapping end-of-stream to
+    ``_STREAM_EOF`` so the sentinel survives the ``asyncio.wait`` task
+    boundary (a bare ``StopAsyncIteration`` would be swallowed)."""
+    try:
+        return await chunks.__anext__()
+    except StopAsyncIteration:
+        return _STREAM_EOF
+
+
+def _effective_stream_timeout(
+    idle_timeout: float, max_lifetime: float, started: float
+) -> float | None:
+    """Seconds until the next upstream read must complete, or ``None``
+    when neither bound is enabled. Returns ``0.0`` once the max lifetime
+    has already elapsed (``asyncio.wait`` then reaps the read on the
+    next scheduling turn)."""
+    candidates: list[float] = []
+    if idle_timeout > 0:
+        candidates.append(float(idle_timeout))
+    if max_lifetime > 0:
+        candidates.append(max(0.0, float(max_lifetime) - (time.monotonic() - started)))
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+async def _watch_for_disconnect(receive: Receive) -> None:
+    """Consume the ASGI ``receive`` channel until the client disconnects.
+
+    This is the *sole* consumer of the channel: Starlette's
+    ``StreamingResponse`` never calls ``receive`` itself once the body
+    has been drained, so a dedicated watcher is safe. The first
+    ``http.disconnect`` message (or any channel error) returns and lets
+    the caller abort the upstream subscription.
+    """
+    while True:
+        try:
+            message = await receive()
+        except Exception:
+            return
+        if message.get("type") == "http.disconnect":
+            return
 
 
 async def _stream_thread_events(
     thread_id: str,
     body: bytes,
     content_type: str,
+    *,
+    receive: Receive | None = None,
 ) -> AsyncIterator[bytes]:
+    """Proxy the upstream thread event stream to the dashboard client.
+
+    ``receive`` is the ASGI ``receive`` channel of the *dashboard*
+    request. When provided, a watcher task consumes it so a client
+    disconnect (or the idle / max-lifetime bounds) aborts the upstream
+    LangGraph subscription; without it the generator degrades to the
+    plain proxy (e.g. in tests).
+    """
     url = f"{langgraph_url().rstrip('/')}/threads/{thread_id}/stream/events"
     headers = _langgraph_proxy_headers(content_type=content_type, accept="text/event-stream")
+    idle_timeout = _stream_idle_timeout()
+    max_lifetime = _stream_max_lifetime()
+    started = time.monotonic()
+    disconnect_task: asyncio.Task[None] | None = None
+    if receive is not None:
+        disconnect_task = asyncio.create_task(_watch_for_disconnect(receive))
+    read_task: asyncio.Task[Any] | None = None
 
     try:
         async with httpx.AsyncClient(timeout=_PROXY_STREAM_TIMEOUT) as client:
@@ -2608,10 +2713,51 @@ async def _stream_thread_events(
                     }
                     yield f"event: error\ndata: {json.dumps(payload)}\n\n".encode()
                     return
-                async for chunk in response.aiter_bytes():
+                chunks: AsyncIterator[bytes] = response.aiter_bytes()
+                while True:
+                    deadline = _effective_stream_timeout(idle_timeout, max_lifetime, started)
+                    read_task = asyncio.ensure_future(_next_chunk(chunks))
+                    done: set[asyncio.Task[Any]] = set()
+                    if disconnect_task is not None:
+                        done, _ = await asyncio.wait(
+                            {read_task, disconnect_task},
+                            timeout=deadline,
+                            return_when="FIRST_COMPLETED",
+                        )
+                    else:
+                        done, _ = await asyncio.wait({read_task}, timeout=deadline)
+                    if disconnect_task is not None and disconnect_task in done:
+                        logger.info(
+                            "stream/events proxy: client disconnected for %s; recycling upstream subscription",
+                            thread_id,
+                        )
+                        read_task.cancel()
+                        break
+                    if read_task not in done:
+                        logger.info(
+                            "stream/events proxy: recycling idle upstream subscription for %s after %.1fs",
+                            thread_id,
+                            time.monotonic() - started,
+                        )
+                        read_task.cancel()
+                        break
+                    chunk = read_task.result()
+                    if chunk is _STREAM_EOF:
+                        break
                     yield chunk
     except Exception:
-        logger.warning("LangGraph stream/events proxy closed for %s", thread_id, exc_info=True)
+        logger.exception("LangGraph stream/events proxy closed for %s", thread_id)
+    finally:
+        # CancelledError derives from BaseException, so suppress it
+        # explicitly when re-awaiting tasks we cancelled ourselves.
+        if read_task is not None and not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await read_task
+        if disconnect_task is not None:
+            disconnect_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await disconnect_task
 
 
 async def _observe_dashboard_run_ttft(
