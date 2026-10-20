@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from langgraph_sdk import get_client
+from ..utils.thread_ops import langgraph_client
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ _refresh_tasks: set[asyncio.Task[None]] = set()
 
 
 def _client():
-    return get_client()
+    return langgraph_client()
 
 
 def _now_ms() -> int:

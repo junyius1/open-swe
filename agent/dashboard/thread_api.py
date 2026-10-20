@@ -3,10 +3,12 @@
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import logging
 import os
 import posixpath
+import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
@@ -16,6 +18,7 @@ import httpx
 from fastapi import HTTPException
 from langchain_core.messages.content import ImageContentBlock, create_image_block
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.types import Receive
 
 from ..dispatch import dispatch_agent_run
 from ..input_messages import (
@@ -46,6 +49,7 @@ from ..utils.thread_ops import (
 )
 from ..utils.thread_participants import PARTICIPANT_LOGINS_KEY, merge_participant_logins
 from ..utils.timing import phase
+from . import state_cache
 from .admin import is_admin
 from .agent_overrides import normalize_profile_overrides
 from .environments import get_environment, slugify
@@ -83,8 +87,45 @@ _SUPPORTED_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif",
 _MAX_DASHBOARD_IMAGES = 5
 _MAX_DASHBOARD_IMAGE_BYTES = 10 * 1024 * 1024
 _PROXY_REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+# History walks and deserializes every checkpoint of the thread; in the inmem
+# dev runtime that comes off multi-GB pickle shards, so full-history fetches
+# can exceed the generic 30s read budget.
+_HISTORY_PROXY_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
 _DISCOVERY_HISTORY_LIMIT = 5
+# Bounded fallbacks for pathologically large threads: when the full history
+# walk times out we serve the latest state (a head-only read) instead of
+# failing, and the send path's pre-run state read is bounded so an oversized
+# thread cannot stall message submission indefinitely. The abandoned history
+# request is still queued on the single-worker runtime, so the fallback retries
+# with backoff instead of spending its budget behind it.
+_STATE_PROXY_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+_FALLBACK_ATTEMPTS = 3
+_FALLBACK_RETRY_BASE_DELAY = 1.5
+_GET_STATE_TIMEOUT = 15.0
+# Concurrent identical history requests (the client retries with the same
+# payload) each queue a full checkpoint deserialization on the single-worker
+# runtime, starving each other's budgets; coalescing them into one upstream
+# call removes that amplification.
+_HISTORY_COALESCING: dict[str, dict[str, Any]] = {}
+_HISTORY_COALESCING_PRUNE_AT = 32
+_FALLBACK_LOCKS: dict[str, asyncio.Lock] = {}
+
+# Short-lived cache of a successful fallback snapshot per thread. The
+# /state snapshot is a valid (if lossy) history substitute and is stable
+# while the thread is idle, so callers that lose the coalesced history race
+# can share one fallback walk instead of each running their own; the TTL
+# bounds the staleness window for a thread that keeps producing runs.
+_FALLBACK_SNAPSHOT_CACHE: dict[str, tuple[float, int, bytes, str | None]] = {}
+_FALLBACK_SNAPSHOT_CACHE_TTL_SECONDS = 30.0
 _PROXY_STREAM_TIMEOUT = httpx.Timeout(None)
+# Lifecycle bounds for the proxied /stream/events subscription.
+_STREAM_IDLE_TIMEOUT_ENV = "OPEN_SWE_STREAM_IDLE_TIMEOUT_SECONDS"
+_STREAM_MAX_LIFETIME_ENV = "OPEN_SWE_STREAM_MAX_LIFETIME_SECONDS"
+_STREAM_IDLE_TIMEOUT_DEFAULT = 60.0
+# The upstream SSE layer emits a ``: ping`` comment every ~15s, so any
+# healthy subscription receives bytes at least that often; 4x that
+# interval catches a silent upstream without recycling a live one.
+_STREAM_MAX_LIFETIME_DEFAULT = 14400.0
 _THREAD_POST_COMMAND_METHODS = frozenset(
     {"run.start", "input.respond", "input.inject", "state.fork"}
 )
@@ -133,6 +174,16 @@ def _langgraph_proxy_headers(
 
 def _thread_is_busy(thread: ThreadLike) -> bool:
     return thread.get("status") == "busy"
+
+
+def _thread_state_version(thread: ThreadLike | None) -> str | None:
+    """Runtime state version (``state_updated_at``) used to key the state cache."""
+    if thread is None:
+        return None
+    data = as_json_object(thread)
+    return state_cache.parse_state_updated_at(
+        data.get("state_updated_at") or data.get("updated_at")
+    )
 
 
 async def _resolve_run_email(login: str, profile: dict[str, Any]) -> str | None:
@@ -1569,6 +1620,7 @@ async def _enrich_run_start_command(
     command: dict[str, Any],
     *,
     metadata: dict[str, Any],
+    thread: ThreadLike | None = None,
     thread_busy: bool = False,
     creating: bool = False,
     email: str | None = None,
@@ -1661,7 +1713,23 @@ async def _enrich_run_start_command(
     persisted_message_ids: set[str] = set()
     if not creating:
         try:
-            prior_state = await client.threads.get_state(thread_id)
+            # Idle-thread fast path: a cache hit means the runtime state is
+            # structurally current (run in flight would have invalidated it),
+            # so skip the read that queues on the runtime's single loop.
+            prior_state = (
+                None if thread_busy else state_cache.get(thread_id, _thread_state_version(thread))
+            )
+            if prior_state is None:
+                # Bounded: on oversized threads the state read walks the full
+                # checkpoint history and can stall message submission; on
+                # timeout we proceed without the dedup/context-hash pre-read
+                # (degrades gracefully, mirroring the except branch).
+                prior_state = await asyncio.wait_for(
+                    client.threads.get_state(thread_id), timeout=_GET_STATE_TIMEOUT
+                )
+                version = _thread_state_version(thread)
+                if version:
+                    state_cache.put(thread_id, version, as_json_object(prior_state))
             values = prior_state.get("values") if isinstance(prior_state, dict) else None
             if isinstance(values, dict):
                 messages = values.get("messages")
@@ -1994,6 +2062,7 @@ async def delete_dashboard_thread(thread_id: str, login: str, *, email: str | No
             logger.debug("Could not cancel run %s for thread %s", run_id, thread_id, exc_info=True)
 
     await client.threads.delete(thread_id)
+    state_cache.invalidate(thread_id)
 
 
 async def resolve_dashboard_thread(
@@ -2102,21 +2171,68 @@ async def get_dashboard_thread_state(
         client, thread, timings=record
     )
     metadata = thread_metadata(thread)
+    # A run is in flight when the thread is busy or the latest run (live or
+    # denormalized) is still pending/running; that is also the condition
+    # below that drops `next` for the SDK.
+    metadata_run_status = metadata.get("latest_run_status")
+    run_in_flight = (
+        _thread_is_busy(thread)
+        or latest_run_status in {"pending", "running"}
+        or metadata_run_status in {"pending", "running"}
+    )
     with phase(record, "get_state"):
-        state = await client.threads.get_state(thread_id)
-    result = as_json_object(state)
+        version = _thread_state_version(thread)
+        cached_state = None if run_in_flight else state_cache.get(thread_id, version)
+        if cached_state is not None:
+            # Idle-thread hit: served from this process's memory without
+            # queuing a read on the runtime's single-worker loop.
+            logger.info("state cache hit thread_id=%s %s", thread_id, state_cache.stats())
+            result = {**cached_state}
+        else:
+            if run_in_flight:
+                state_cache.invalidate(thread_id)
+            else:
+                logger.info("state cache miss thread_id=%s %s", thread_id, state_cache.stats())
+            try:
+                state = await asyncio.wait_for(
+                    client.threads.get_state(thread_id),
+                    timeout=_GET_STATE_TIMEOUT,
+                )
+            except TimeoutError:
+                # Oversized/long-lived threads can make the runtime's /state stall
+                # (the inmem dev runtime's single loop is busy with the active run's
+                # checkpoint I/O). Degrade to the denormalized state the thread
+                # record already carries instead of 500ing the refresh; the live
+                # stream reconciles the transcript once a run is in flight.
+                logger.warning(
+                    "thread state read for %s exceeded %.0fs; "
+                    "serving the denormalized thread state instead",
+                    thread_id,
+                    _GET_STATE_TIMEOUT,
+                )
+                values = thread.get("values")
+                result = {
+                    "values": values if isinstance(values, dict) else {},
+                    "next": [],
+                    "metadata": thread.get("metadata"),
+                    "created_at": thread.get("created_at"),
+                    "parent_config": None,
+                    "tasks": [],
+                }
+            else:
+                result = as_json_object(state)
+            # Cache the resolved payload (live or degraded) for idle threads;
+            # the state version in the thread record changes whenever a run
+            # writes a checkpoint, so a stale entry can never match.
+            if version:
+                state_cache.put(thread_id, version, result)
     # The SDK's `useStream` opens its live event subscription only when the
     # hydrated `getState()` looks active (`next` non-empty / absent). When a
     # run was just started out-of-band (our REST run-create), the latest
     # checkpoint can still be the previous finished one with `next == []`,
     # which the SDK reads as idle and never opens the stream. Drop `next`
     # while a run is pending/running so the SDK treats the thread as active.
-    metadata_run_status = metadata.get("latest_run_status")
-    if (
-        _thread_is_busy(thread)
-        or latest_run_status in {"pending", "running"}
-        or metadata_run_status in {"pending", "running"}
-    ):
+    if run_in_flight:
         result.pop("next", None)
     return result
 
@@ -2476,21 +2592,115 @@ async def proxy_dashboard_thread_stream_events(
     *,
     email: str | None = None,
     content_type: str = "application/json",
+    receive: Receive | None = None,
 ) -> AsyncIterator[bytes]:
     # Preflight here (not in the generator) so auth/content-type failures
     # surface as real HTTP errors before the SSE response starts streaming.
     _require_json_content_type(content_type)
     await _readable_thread_metadata(thread_id, login=login, email=email)
-    return _stream_thread_events(thread_id, body, content_type)
+    return _stream_thread_events(thread_id, body, content_type, receive=receive)
+
+
+def _stream_timeout_env(name: str, default: float) -> float:
+    """Read a stream-lifetime bound from the environment at call time.
+
+    Reads (rather than importing) the value lazily so tests can
+    monkeypatch the environment. Unset/empty uses ``default``;
+    ``"0"`` disables the bound (0.0); an unparseable or negative value
+    falls back to ``default``.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return float(default)
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return float(default)
+    if value < 0.0:
+        return float(default)
+    return value
+
+
+def _stream_idle_timeout() -> float:
+    return _stream_timeout_env(_STREAM_IDLE_TIMEOUT_ENV, _STREAM_IDLE_TIMEOUT_DEFAULT)
+
+
+def _stream_max_lifetime() -> float:
+    return _stream_timeout_env(_STREAM_MAX_LIFETIME_ENV, _STREAM_MAX_LIFETIME_DEFAULT)
+
+
+_STREAM_EOF = object()
+
+
+async def _next_chunk(chunks: AsyncIterator[bytes]) -> bytes | object:
+    """Advance the upstream chunk iterator, mapping end-of-stream to
+    ``_STREAM_EOF`` so the sentinel survives the ``asyncio.wait`` task
+    boundary (a bare ``StopAsyncIteration`` would be swallowed)."""
+    try:
+        return await chunks.__anext__()
+    except StopAsyncIteration:
+        return _STREAM_EOF
+
+
+def _effective_stream_timeout(
+    idle_timeout: float, max_lifetime: float, started: float
+) -> float | None:
+    """Seconds until the next upstream read must complete, or ``None``
+    when neither bound is enabled. Returns ``0.0`` once the max lifetime
+    has already elapsed (``asyncio.wait`` then reaps the read on the
+    next scheduling turn)."""
+    candidates: list[float] = []
+    if idle_timeout > 0:
+        candidates.append(float(idle_timeout))
+    if max_lifetime > 0:
+        candidates.append(max(0.0, float(max_lifetime) - (time.monotonic() - started)))
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+async def _watch_for_disconnect(receive: Receive) -> None:
+    """Consume the ASGI ``receive`` channel until the client disconnects.
+
+    This is the *sole* consumer of the channel: Starlette's
+    ``StreamingResponse`` never calls ``receive`` itself once the body
+    has been drained, so a dedicated watcher is safe. The first
+    ``http.disconnect`` message (or any channel error) returns and lets
+    the caller abort the upstream subscription.
+    """
+    while True:
+        try:
+            message = await receive()
+        except Exception:
+            return
+        if message.get("type") == "http.disconnect":
+            return
 
 
 async def _stream_thread_events(
     thread_id: str,
     body: bytes,
     content_type: str,
+    *,
+    receive: Receive | None = None,
 ) -> AsyncIterator[bytes]:
+    """Proxy the upstream thread event stream to the dashboard client.
+
+    ``receive`` is the ASGI ``receive`` channel of the *dashboard*
+    request. When provided, a watcher task consumes it so a client
+    disconnect (or the idle / max-lifetime bounds) aborts the upstream
+    LangGraph subscription; without it the generator degrades to the
+    plain proxy (e.g. in tests).
+    """
     url = f"{langgraph_url().rstrip('/')}/threads/{thread_id}/stream/events"
     headers = _langgraph_proxy_headers(content_type=content_type, accept="text/event-stream")
+    idle_timeout = _stream_idle_timeout()
+    max_lifetime = _stream_max_lifetime()
+    started = time.monotonic()
+    disconnect_task: asyncio.Task[None] | None = None
+    if receive is not None:
+        disconnect_task = asyncio.create_task(_watch_for_disconnect(receive))
+    read_task: asyncio.Task[Any] | None = None
 
     try:
         async with httpx.AsyncClient(timeout=_PROXY_STREAM_TIMEOUT) as client:
@@ -2503,10 +2713,51 @@ async def _stream_thread_events(
                     }
                     yield f"event: error\ndata: {json.dumps(payload)}\n\n".encode()
                     return
-                async for chunk in response.aiter_bytes():
+                chunks: AsyncIterator[bytes] = response.aiter_bytes()
+                while True:
+                    deadline = _effective_stream_timeout(idle_timeout, max_lifetime, started)
+                    read_task = asyncio.ensure_future(_next_chunk(chunks))
+                    done: set[asyncio.Task[Any]] = set()
+                    if disconnect_task is not None:
+                        done, _ = await asyncio.wait(
+                            {read_task, disconnect_task},
+                            timeout=deadline,
+                            return_when="FIRST_COMPLETED",
+                        )
+                    else:
+                        done, _ = await asyncio.wait({read_task}, timeout=deadline)
+                    if disconnect_task is not None and disconnect_task in done:
+                        logger.info(
+                            "stream/events proxy: client disconnected for %s; recycling upstream subscription",
+                            thread_id,
+                        )
+                        read_task.cancel()
+                        break
+                    if read_task not in done:
+                        logger.info(
+                            "stream/events proxy: recycling idle upstream subscription for %s after %.1fs",
+                            thread_id,
+                            time.monotonic() - started,
+                        )
+                        read_task.cancel()
+                        break
+                    chunk = read_task.result()
+                    if chunk is _STREAM_EOF:
+                        break
                     yield chunk
     except Exception:
-        logger.warning("LangGraph stream/events proxy closed for %s", thread_id, exc_info=True)
+        logger.exception("LangGraph stream/events proxy closed for %s", thread_id)
+    finally:
+        # CancelledError derives from BaseException, so suppress it
+        # explicitly when re-awaiting tasks we cancelled ourselves.
+        if read_task is not None and not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await read_task
+        if disconnect_task is not None:
+            disconnect_task.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await disconnect_task
 
 
 async def _observe_dashboard_run_ttft(
@@ -2602,6 +2853,7 @@ async def proxy_dashboard_thread_commands(
         login,
         parsed,
         metadata=metadata,
+        thread=thread,
         thread_busy=thread_busy,
         creating=creating,
         email=email,
@@ -2667,8 +2919,159 @@ async def proxy_dashboard_thread_commands(
                 thread_id,
                 exc_info=True,
             )
+        state_cache.invalidate(thread_id)
     media_type = response.headers.get("content-type")
     return response.status_code, response.content, media_type
+
+
+async def _shared_history_request(
+    thread_id: str,
+    payload: dict[str, Any],
+    content_type: str,
+) -> httpx.Response:
+    """Issue one runtime history call per thread+payload, shared by
+    concurrent callers so identical in-flight requests do not multiply the
+    runtime load."""
+    key = f"{thread_id}:{json.dumps(payload, sort_keys=True)}"
+    shared = _HISTORY_COALESCING.get(key)
+    if shared is None:
+        if len(_HISTORY_COALESCING) >= _HISTORY_COALESCING_PRUNE_AT:
+            for done_key in [
+                entry_key
+                for entry_key, entry in _HISTORY_COALESCING.items()
+                if entry["event"].is_set()
+            ]:
+                _HISTORY_COALESCING.pop(done_key, None)
+        shared = {"event": asyncio.Event(), "response": None, "exc": None}
+        _HISTORY_COALESCING[key] = shared
+        url = f"{langgraph_url().rstrip('/')}/threads/{thread_id}/history"
+        headers = _langgraph_proxy_headers(content_type=content_type)
+        try:
+            async with httpx.AsyncClient(timeout=_HISTORY_PROXY_TIMEOUT) as client:
+                shared["response"] = await client.post(url, json=payload, headers=headers)
+        except Exception as exc:
+            shared["exc"] = exc
+        finally:
+            # Late joiners see a fresh key and start their own call; in-flight
+            # followers keep holding the shared dict reference.
+            shared["event"].set()
+            _HISTORY_COALESCING.pop(key, None)
+    else:
+        await shared["event"].wait()
+    exc = shared["exc"]
+    response = shared["response"]
+    if exc is not None:
+        raise exc
+    assert response is not None
+    return response
+
+
+async def _history_head_read(
+    thread_id: str,
+) -> httpx.Response:
+    """One head-only fallback read: the latest history entry, else the latest
+    state normalized to the single-entry history shape the client expects.
+
+    ``/history {"limit": 1}`` and ``/state`` return the same object shape as
+    one history entry, so the client's history handling is unaffected.
+    """
+    runtime_base = langgraph_url().rstrip("/")
+    headers = _langgraph_proxy_headers(content_type="application/json")
+    async with httpx.AsyncClient(timeout=_STATE_PROXY_TIMEOUT) as client:
+        response = await client.post(
+            f"{runtime_base}/threads/{thread_id}/history",
+            json={"limit": 1},
+            headers=headers,
+        )
+    if response.status_code != 200:
+        logger.info(
+            "History fallback limit=1 returned %s for thread %s; trying /state",
+            response.status_code,
+            thread_id,
+        )
+        response = await client.get(f"{runtime_base}/threads/{thread_id}/state", headers=headers)
+        if response.status_code != 200:
+            raise LookupError(
+                f"history fallback limit=1 returned {response.status_code} for thread {thread_id}"
+            )
+        return httpx.Response(
+            200,
+            content=json.dumps([response.json()]).encode("utf-8"),
+            headers={"content-type": "application/json"},
+        )
+    return response
+
+
+async def _history_state_fallback(
+    thread_id: str,
+    content_type: str,
+    *,
+    reason: str,
+) -> tuple[int, bytes, str | None]:
+    """Serve the latest snapshot (as a single history entry) when the full
+    history walk cannot complete in time; serialized per thread so concurrent
+    duplicates do not multiply the runtime load."""
+    loop = asyncio.get_running_loop()
+    cached = _FALLBACK_SNAPSHOT_CACHE.get(thread_id)
+    if cached is not None and loop.time() - cached[0] < _FALLBACK_SNAPSHOT_CACHE_TTL_SECONDS:
+        _, status, body, media_type = cached
+        return status, body, media_type
+    lock = _FALLBACK_LOCKS.setdefault(thread_id, asyncio.Lock())
+    async with lock:
+        cached = _FALLBACK_SNAPSHOT_CACHE.get(thread_id)
+        if cached is not None and loop.time() - cached[0] < _FALLBACK_SNAPSHOT_CACHE_TTL_SECONDS:
+            _, status, body, media_type = cached
+            return status, body, media_type
+        status, body, media_type = await _history_state_fallback_serialized(
+            thread_id, content_type, reason=reason
+        )
+        if status == 200:
+            _FALLBACK_SNAPSHOT_CACHE[thread_id] = (loop.time(), status, body, media_type)
+        return status, body, media_type
+
+
+async def _history_state_fallback_serialized(
+    thread_id: str,
+    content_type: str,
+    *,
+    reason: str,
+) -> tuple[int, bytes, str | None]:
+    """Serve the latest snapshot (as a single history entry) when the full
+    history walk cannot complete in time.
+
+    The abandoned history request is still queued on the single-worker
+    runtime, so the first fallback attempt usually burns its budget behind
+    it; retry with backoff before giving up, keeping 503 a last resort.
+    """
+    logger.info("History proxy degrading to /state for thread %s: %s", thread_id, reason)
+    for attempt in range(1, _FALLBACK_ATTEMPTS + 1):
+        try:
+            response = await _history_head_read(thread_id)
+        except httpx.TimeoutException:
+            logger.warning("History fallback attempt %d missed for thread %s", attempt, thread_id)
+        except LookupError:
+            logger.warning("History fallback attempt %d missed for thread %s", attempt, thread_id)
+        except httpx.HTTPError:
+            logger.warning(
+                "History fallback could not reach the LangGraph runtime for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+            raise HTTPException(502, "could not reach the LangGraph runtime") from None
+        else:
+            media_type = response.headers.get("content-type")
+            return 200, response.content, media_type
+        if attempt < _FALLBACK_ATTEMPTS:
+            delay = _FALLBACK_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.info(
+                "History fallback retrying thread %s in %.1fs (attempt %d/%d)",
+                thread_id,
+                delay,
+                attempt,
+                _FALLBACK_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+    raise HTTPException(503, "thread history request timed out; retry")
 
 
 async def proxy_dashboard_thread_history(
@@ -2692,10 +3095,20 @@ async def proxy_dashboard_thread_history(
         raise HTTPException(400, "history limit must be a positive integer")
     if not any(payload.get(key) for key in ("before", "checkpoint", "metadata")):
         payload["limit"] = min(limit, _DISCOVERY_HISTORY_LIMIT)
-    url = f"{langgraph_url().rstrip('/')}/threads/{thread_id}/history"
-    headers = _langgraph_proxy_headers(content_type=content_type)
-    async with httpx.AsyncClient(timeout=_PROXY_REQUEST_TIMEOUT) as client:
-        response = await client.post(url, json=payload, headers=headers)
+    try:
+        response = await _shared_history_request(thread_id, payload, content_type)
+    except httpx.TimeoutException:
+        logger.warning(
+            "History proxy timed out for thread %s (limit=%r)", thread_id, payload.get("limit")
+        )
+        return await _history_state_fallback(
+            thread_id,
+            content_type,
+            reason=f"history walk timed out (limit={payload.get('limit')!r})",
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("History proxy could not reach the LangGraph runtime", exc_info=True)
+        raise HTTPException(502, "could not reach the LangGraph runtime") from exc
     media_type = response.headers.get("content-type")
     return response.status_code, response.content, media_type
 

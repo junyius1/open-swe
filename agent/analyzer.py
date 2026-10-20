@@ -37,6 +37,7 @@ from .middleware import (
     PrepareRunState,
     SanitizeOpenAIResponsesMiddleware,
     SanitizeToolInputsMiddleware,
+    StripThoughtsMiddleware,
     TimeoutWrapupMiddleware,
     ToolErrorMiddleware,
 )
@@ -107,9 +108,9 @@ async def _cached_gateway_enabled() -> bool:
     )
 
 
-def _make_model_or_defer(model_id: str, *, use_gateway: bool, **kwargs: Any) -> BaseChatModel:
+async def _make_model_or_defer(model_id: str, *, use_gateway: bool, **kwargs: Any) -> BaseChatModel:
     try:
-        return make_model(model_id, use_gateway=use_gateway, **kwargs)
+        return await make_model(model_id, use_gateway=use_gateway, **kwargs)
     except Exception as e:  # noqa: BLE001
         logger.warning("Deferring analyzer model setup failure for %s", model_id, exc_info=True)
         return make_deferred_error_model(e, model_id=model_id)
@@ -185,7 +186,7 @@ async def get_analyzer(config: RunnableConfig) -> Pregel:
     )
 
     return create_deep_agent(
-        model=_make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs),
+        model=await _make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs),
         system_prompt="",
         tools=[save_review_style_prompt, read_finding_outcomes],
         backend=backend,
@@ -202,6 +203,7 @@ async def get_analyzer(config: RunnableConfig) -> Pregel:
                 ToolErrorMiddleware(),
                 TimeoutWrapupMiddleware(),
                 SanitizeOpenAIResponsesMiddleware(),
+                StripThoughtsMiddleware(),
             ],
         ),
     ).with_config(config)

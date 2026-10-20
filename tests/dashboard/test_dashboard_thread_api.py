@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 from types import SimpleNamespace
@@ -5,10 +6,11 @@ from typing import cast
 from unittest.mock import AsyncMock, patch
 from xml.etree import ElementTree
 
+import httpx
 import pytest
 from fastapi import HTTPException
 
-from agent.dashboard import routes, thread_api
+from agent.dashboard import routes, state_cache, thread_api
 from agent.dashboard.agent_overrides import resolve_agent_model_id
 from agent.dashboard.options import model_supports_images
 from agent.dashboard.ttft import AssistantTextObservation
@@ -1243,6 +1245,15 @@ async def test_run_cancel_enforces_thread_ownership(monkeypatch) -> None:
     assert exc_info.value.status_code == 404
 
 
+@pytest.fixture(autouse=True)
+def _reset_history_proxy_shared_state():
+    thread_api._HISTORY_COALESCING.clear()
+    thread_api._FALLBACK_LOCKS.clear()
+    thread_api._FALLBACK_SNAPSHOT_CACHE.clear()
+    thread_api.state_cache.clear()
+    yield
+
+
 async def test_read_endpoints_accessible_by_non_owner(monkeypatch) -> None:
     """Read endpoints (state, stream, history) are accessible by any org member."""
 
@@ -1308,6 +1319,283 @@ async def test_read_endpoints_accessible_by_non_owner(monkeypatch) -> None:
     assert exc_info.value.status_code == 400
 
 
+async def test_history_proxy_coalesces_concurrent_identical_requests(monkeypatch) -> None:
+    """Concurrent identical history requests must issue a single runtime call."""
+
+    class FakeThreads:
+        async def get(self, thread_id: str) -> dict[str, object]:
+            return {
+                "thread_id": "tid",
+                "metadata": {"source": "slack", "github_login": "owner"},
+            }
+
+    class FakeClient:
+        threads = FakeThreads()
+
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: FakeClient())
+
+    upstream_posts: list[dict[str, object]] = []
+    release_upstream = asyncio.Event()
+    history_body = b"[{latest}]"
+
+    class CoalesceClient:
+        def __init__(self, *a: object, **kw: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "CoalesceClient":
+            return self
+
+        async def __aexit__(self, *a: object) -> None:
+            pass
+
+        async def post(self, *a: object, **kw: object):
+            upstream_posts.append(kw["json"])
+            await release_upstream.wait()
+            return SimpleNamespace(
+                status_code=200,
+                content=history_body,
+                headers={"content-type": "application/json"},
+            )
+
+        async def get(self, *a: object, **kw: object) -> None:
+            raise AssertionError("get should not be called")
+
+    monkeypatch.setattr(thread_api.httpx, "AsyncClient", CoalesceClient)
+
+    async def run_both() -> object:
+        return await asyncio.gather(
+            thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 20}'),
+            thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 20}'),
+        )
+
+    task = asyncio.create_task(run_both())
+    try:
+        await asyncio.sleep(0.2)
+        release_upstream.set()
+        results = await task
+    finally:
+        release_upstream.set()
+    assert results == [(200, history_body, "application/json")] * 2
+    assert len(upstream_posts) == 1
+    assert upstream_posts[0] == {"limit": thread_api._DISCOVERY_HISTORY_LIMIT}
+    assert thread_api._HISTORY_COALESCING == {}
+
+
+async def test_history_fallback_serializes_concurrent_duplicates(monkeypatch) -> None:
+    """Concurrent history timeouts share one serialized fallback, not N parallel ones."""
+
+    class FakeThreads:
+        async def get(self, thread_id: str) -> dict[str, object]:
+            return {
+                "thread_id": "tid",
+                "metadata": {"source": "slack", "github_login": "owner"},
+            }
+
+    class FakeClient:
+        threads = FakeThreads()
+
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: FakeClient())
+
+    head_calls: list[str] = []
+    state_body = json.dumps(
+        [
+            {
+                "values": {},
+                "next": [],
+                "tasks": [],
+                "metadata": {},
+                "created_at": "t",
+                "checkpoint": {},
+                "parent_checkpoint": {},
+                "interrupts": [],
+                "checkpoint_id": "ck1",
+                "parent_checkpoint_id": "ck0",
+            }
+        ]
+    ).encode("utf-8")
+
+    class FallbackClient:
+        def __init__(self, *a: object, **kw: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "FallbackClient":
+            return self
+
+        async def __aexit__(self, *a: object) -> None:
+            pass
+
+        async def post(self, *a: object, **kw: object):
+            if kw.get("json") == {"limit": 1}:
+                head_calls.append("limit1")
+                await asyncio.sleep(0.05)
+                return SimpleNamespace(
+                    status_code=200,
+                    content=state_body,
+                    headers={"content-type": "application/json"},
+                )
+            raise httpx.ReadTimeout("read timed out")
+
+        async def get(self, *a: object, **kw: object):
+            head_calls.append("state")
+            await asyncio.sleep(0.05)
+            return SimpleNamespace(
+                status_code=200,
+                content=state_body,
+                headers={"content-type": "application/json"},
+            )
+
+    monkeypatch.setattr(thread_api.httpx, "AsyncClient", FallbackClient)
+    monkeypatch.setattr(thread_api, "_FALLBACK_RETRY_BASE_DELAY", 0.01)
+    results = await asyncio.gather(
+        thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 20}'),
+        thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 20}'),
+    )
+    assert results == [(200, state_body, "application/json")] * 2
+    # The fallback limit=1 head read runs once for both callers: the per-thread
+    # fallback lock serializes them.
+    assert head_calls.count("limit1") == 1
+    assert thread_api._HISTORY_COALESCING == {}
+
+
+async def test_history_proxy_maps_upstream_errors_to_http(monkeypatch) -> None:
+    """Upstream history failures must surface as clean HTTP errors, not 500s."""
+
+    class FakeThreads:
+        async def get(self, thread_id: str) -> dict[str, object]:
+            return {
+                "thread_id": "tid",
+                "metadata": {"source": "slack", "github_login": "owner"},
+            }
+
+    class FakeClient:
+        threads = FakeThreads()
+
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: FakeClient())
+
+    seen_timeouts: list[httpx.Timeout] = []
+    history_state = {
+        "values": {"messages": [{"id": "m1", "type": "human", "content": "hi"}]},
+        "next": [],
+        "tasks": [],
+        "metadata": {"step": 1},
+        "created_at": "2026-01-01T00:00:00Z",
+        "checkpoint": {"thread_id": "tid"},
+        "parent_checkpoint": {"thread_id": "tid"},
+        "interrupts": [],
+        "checkpoint_id": "ck1",
+        "parent_checkpoint_id": "ck0",
+    }
+
+    def make_client(
+        fallback_post_error: Exception | None = None,
+        fallback_get_error: Exception | None = None,
+    ):
+        class MixedAsyncClient:
+            def __init__(self, *a: object, **kw: object) -> None:
+                seen_timeouts.append(kw["timeout"])
+
+            async def __aenter__(self) -> "MixedAsyncClient":
+                return self
+
+            async def __aexit__(self, *a: object) -> None:
+                pass
+
+            async def post(self, *a: object, **kw: object):
+                # The full history walk (the original request) always fails
+                # here; the limit=1 fallback may succeed.
+                if kw.get("json") != {"limit": 1}:
+                    raise httpx.ReadTimeout("read timed out")
+                if fallback_post_error is not None:
+                    raise fallback_post_error
+
+                class _EntryResp:
+                    status_code = 200
+                    content = json.dumps([history_state]).encode("utf-8")
+                    headers = {"content-type": "application/json"}
+
+                return _EntryResp()
+
+            async def get(self, *a: object, **kw: object):
+                if fallback_get_error is not None:
+                    raise fallback_get_error
+
+                class _Resp:
+                    status_code = 200
+                    headers = {"content-type": "application/json"}
+
+                    def json(self):
+                        return history_state
+
+                return _Resp()
+
+        return MixedAsyncClient
+
+    # A slow inmem runtime (large checkpoint shards) must not 500 the
+    # dashboard. When the full history walk times out we degrade to the
+    # head-only latest history entry, so the client still gets the latest
+    # snapshot.
+    monkeypatch.setattr(thread_api.httpx, "AsyncClient", make_client())
+    del seen_timeouts[:]
+    status, body, media = await thread_api.proxy_dashboard_thread_history(
+        "tid", "teammate", b'{"limit": 1000}'
+    )
+    assert status == 200
+    assert media == "application/json"
+    assert json.loads(body) == [history_state]
+    assert seen_timeouts == [thread_api._HISTORY_PROXY_TIMEOUT, thread_api._STATE_PROXY_TIMEOUT]
+
+    # If the fallback reads keep timing out (the abandoned history request is
+    # still queued on the single-worker runtime), retry with backoff and only
+    # surface the 503 after all attempts, so the client can retry.
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(thread_api.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        thread_api.httpx,
+        "AsyncClient",
+        make_client(
+            fallback_post_error=httpx.ReadTimeout("again"),
+            fallback_get_error=httpx.ReadTimeout("still again"),
+        ),
+    )
+    del seen_timeouts[:]
+    thread_api._FALLBACK_SNAPSHOT_CACHE.clear()
+    with pytest.raises(HTTPException) as exc_info:
+        await thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 1000}')
+    assert exc_info.value.status_code == 503
+    assert (
+        seen_timeouts
+        == [thread_api._HISTORY_PROXY_TIMEOUT]
+        + [thread_api._STATE_PROXY_TIMEOUT] * thread_api._FALLBACK_ATTEMPTS
+    )
+    assert sleeps == [1.5, 3.0]
+
+    # Any transport failure on the history walk is an upstream 502, not an
+    # unhandled 500.
+    class RefuseClient:
+        def __init__(self, *a: object, **kw: object) -> None:
+            seen_timeouts.append(kw["timeout"])
+
+        async def __aenter__(self) -> "RefuseClient":
+            return self
+
+        async def __aexit__(self, *a: object) -> None:
+            pass
+
+        async def post(self, *a: object, **kw: object) -> None:
+            raise httpx.ConnectError("connection refused")
+
+        async def get(self, *a: object, **kw: object) -> None:
+            raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(thread_api.httpx, "AsyncClient", RefuseClient)
+    with pytest.raises(HTTPException) as exc_info:
+        await thread_api.proxy_dashboard_thread_history("tid", "teammate", b'{"limit": 5}')
+    assert exc_info.value.status_code == 502
+
+
 async def test_thread_state_uses_current_run_status_when_checkpoint_is_stale(monkeypatch) -> None:
     class FakeThreads:
         async def get(self, thread_id: str) -> dict[str, object]:
@@ -1340,6 +1628,51 @@ async def test_thread_state_uses_current_run_status_when_checkpoint_is_stale(mon
     state = await thread_api.get_dashboard_thread_state("tid", "owner")
 
     assert "next" not in state
+
+
+async def test_thread_state_degrades_to_denormalized_state_on_read_timeout(monkeypatch) -> None:
+    """A stalled runtime /state must not 500 the refresh; serve the
+    denormalized thread state instead."""
+    import asyncio
+
+    monkeypatch.setattr(thread_api, "_GET_STATE_TIMEOUT", 0.01)
+
+    class FakeThreads:
+        async def get(self, thread_id: str) -> dict[str, object]:
+            return {
+                "thread_id": thread_id,
+                "status": "idle",
+                "created_at": "2026-01-01T00:00:00Z",
+                "metadata": {
+                    "source": "dashboard",
+                    "github_login": "owner",
+                    "latest_run_status": "success",
+                },
+                "values": {"messages": [{"id": "m1"}]},
+            }
+
+        async def update(self, **kwargs: object) -> None:
+            pass
+
+        async def get_state(self, thread_id: str) -> dict[str, object]:
+            await asyncio.sleep(1.0)  # simulates the stalled runtime /state
+            return {"values": {"messages": []}, "next": []}
+
+    class FakeRuns:
+        async def list(self, thread_id: str, *, limit: int) -> list[dict[str, str]]:
+            return []
+
+    class FakeClient:
+        threads = FakeThreads()
+        runs = FakeRuns()
+
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: FakeClient())
+
+    state = await thread_api.get_dashboard_thread_state("tid", "owner")
+
+    assert state["values"] == {"messages": [{"id": "m1"}]}
+    assert state["next"] == []
+    assert state["created_at"] == "2026-01-01T00:00:00Z"
 
 
 async def test_read_endpoints_reject_non_surfaced_source(monkeypatch) -> None:
@@ -2661,3 +2994,211 @@ def test_admin_cancel_thread_dependency_rejects_non_admin(monkeypatch) -> None:
         routes._require_admin({"sub": "not-admin", "email": "user@example.com"})
 
     assert exc_info.value.status_code == 403
+
+
+class _CachedStateThreads:
+    def __init__(self, thread: dict[str, object], state: dict[str, object]) -> None:
+        self.thread = thread
+        self.state = state
+        self.get_state_calls = 0
+
+    async def get(self, thread_id: str) -> dict[str, object]:
+        return self.thread
+
+    async def update(self, **kwargs: object) -> None:
+        pass
+
+    async def get_state(self, thread_id: str) -> dict[str, object]:
+        self.get_state_calls += 1
+        return self.state
+
+
+class _CachedStateClient:
+    def __init__(self, threads: _CachedStateThreads) -> None:
+        self.threads = threads
+        self.runs_list_calls = 0
+
+    async def _no_runs(self, thread_id: str, *, limit: int) -> list[dict[str, str]]:
+        self.runs_list_calls += 1
+        return []
+
+    runs: object
+
+
+async def test_state_cache_hit_serves_memory_without_runtime_read(monkeypatch) -> None:
+    """A second idle /state read must hit the in-process cache and not
+    queue a read on the runtime (no get_state call, no runs list)."""
+    threads = _CachedStateThreads(
+        {
+            "thread_id": "tid",
+            "status": "idle",
+            "state_updated_at": "v1",
+            "metadata": {"source": "dashboard", "github_login": "owner"},
+        },
+        {"values": {"messages": [{"id": "m1"}]}, "next": []},
+    )
+    client = _CachedStateClient(threads)
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: client)
+
+    first = await thread_api.get_dashboard_thread_state("tid", "owner")
+    assert first["values"] == {"messages": [{"id": "m1"}]}
+    assert threads.get_state_calls == 1
+
+    stats_before = state_cache.stats()
+    assert stats_before["hits"] == 0 and stats_before["misses"] == 1
+    second = await thread_api.get_dashboard_thread_state("tid", "owner")
+    assert second["values"] == {"messages": [{"id": "m1"}]}
+    assert threads.get_state_calls == 1
+    stats_after = state_cache.stats()
+    assert stats_after["hits"] == stats_before["hits"] + 1
+
+
+async def test_state_cache_miss_on_new_state_version(monkeypatch) -> None:
+    """When the thread record's state version moves, the entry stops
+    matching and the next read goes to the runtime."""
+    threads = _CachedStateThreads(
+        {
+            "thread_id": "tid",
+            "status": "idle",
+            "state_updated_at": "v1",
+            "metadata": {"source": "dashboard", "github_login": "owner"},
+        },
+        {"values": {"messages": [{"id": "m1"}]}, "next": []},
+    )
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: _CachedStateClient(threads))
+
+    await thread_api.get_dashboard_thread_state("tid", "owner")
+    threads.thread = {**threads.thread, "state_updated_at": "v2"}
+    threads.state = {"values": {"messages": [{"id": "m2"}]}, "next": []}
+
+    second = await thread_api.get_dashboard_thread_state("tid", "owner")
+    assert second["values"] == {"messages": [{"id": "m2"}]}
+    assert threads.get_state_calls == 2
+    assert state_cache.stats()["misses"] == 2
+
+
+async def test_state_cache_skipped_while_run_in_flight(monkeypatch) -> None:
+    """A pending/running latest run must bypass the cache and keep
+    dropping `next` for the SDK."""
+    threads = _CachedStateThreads(
+        {
+            "thread_id": "tid",
+            "status": "busy",
+            "state_updated_at": "v1",
+            "metadata": {
+                "source": "dashboard",
+                "github_login": "owner",
+                "latest_run_status": "running",
+            },
+        },
+        {"values": {"messages": []}, "next": ["agent"]},
+    )
+    client = _CachedStateClient(threads)
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: client)
+
+    class FakeRuns:
+        async def list(self, thread_id: str, *, limit: int) -> list[dict[str, str]]:
+            return [{"run_id": "run-1", "status": "running"}]
+
+    client.runs = FakeRuns()
+
+    for _ in range(2):
+        state = await thread_api.get_dashboard_thread_state("tid", "owner")
+        assert "next" not in state
+    assert threads.get_state_calls == 2
+    stats = state_cache.stats()
+    assert stats["hits"] == 0
+    assert stats["invalidations"] >= 1
+
+
+async def test_send_path_prefill_uses_state_cache(monkeypatch) -> None:
+    """The run.start pre-read must hit the cache instead of calling
+    get_state when the thread is idle, and a started run must invalidate."""
+    threads = _CachedStateThreads(
+        {
+            "thread_id": "tid",
+            "status": "idle",
+            "state_updated_at": "v1",
+            "metadata": {
+                "source": "dashboard",
+                "github_login": "owner",
+                "participant_logins": ["owner"],
+            },
+        },
+        {"values": {"messages": [{"id": "m1"}]}, "next": []},
+    )
+    client = _CachedStateClient(threads)
+    monkeypatch.setattr(thread_api, "langgraph_client", lambda: client)
+
+    async def fake_get_profile(login: str) -> dict[str, object]:
+        return {}
+
+    async def fake_ensure_token(login: str) -> None:
+        pass
+
+    async def fake_resolve_email(login: str, profile: dict[str, object]) -> str:
+        return f"{login}@example.com"
+
+    monkeypatch.setattr(thread_api, "get_profile", fake_get_profile)
+    monkeypatch.setattr(thread_api, "_ensure_dashboard_github_token", fake_ensure_token)
+    monkeypatch.setattr(thread_api, "_resolve_run_email", fake_resolve_email)
+
+    # Prime the cache through the /state endpoint.
+    await thread_api.get_dashboard_thread_state("tid", "owner")
+    assert threads.get_state_calls == 1
+
+    command = {
+        "method": "run.start",
+        "params": {"input": {"messages": [{"role": "user", "content": "next"}]}},
+    }
+    await thread_api._enrich_run_start_command(
+        "tid",
+        "owner",
+        command,
+        metadata=thread_api.thread_metadata(threads.thread),
+        thread=threads.thread,
+        email="owner@example.com",
+    )
+    # Pre-read came from the cache: no second runtime read.
+    assert threads.get_state_calls == 1
+
+    # After a run starts, the cache must be dirty so the next /state read
+    # goes to the runtime.
+    state_cache.invalidate("tid")
+    await thread_api.get_dashboard_thread_state("tid", "owner")
+    assert threads.get_state_calls == 2
+
+
+def test_state_cache_eviction_and_tombstone() -> None:
+    import os
+
+    original = os.environ.get("DASHBOARD_STATE_CACHE_MAX_ENTRIES")
+    os.environ["DASHBOARD_STATE_CACHE_MAX_ENTRIES"] = "2"
+    try:
+        state_cache._MAX_ENTRIES = 2
+        state_cache.clear()
+        state_cache.put("a", "v1", {"values": {}})
+        state_cache.put("b", "v1", {"values": {}})
+        state_cache.put("c", "v1", {"values": {}})
+        assert state_cache.get("a", "v1") is None
+        assert state_cache.get("b", "v1") is not None
+        assert state_cache.get("c", "v1") is not None
+
+        state_cache.invalidate("b")  # fresh entry dropped
+        assert state_cache.get("b", "v1") is None
+        state_cache.invalidate("zz")  # unknown thread -> tombstone (separate key)
+        assert state_cache.get("zz", "v1") is None
+        assert state_cache.stats()["entries"] == 2
+    finally:
+        state_cache._MAX_ENTRIES = int(original or "256")
+        state_cache.clear()
+        if original is not None:
+            os.environ["DASHBOARD_STATE_CACHE_MAX_ENTRIES"] = original
+
+
+def test_state_cache_version_parsing() -> None:
+    assert state_cache.parse_state_updated_at("2026-01-01T00:00:00Z") == "2026-01-01T00:00:00Z"
+    assert state_cache.parse_state_updated_at(None) is None
+    assert state_cache.parse_state_updated_at("") is None
+    parsed = state_cache.parse_state_updated_at(1767225600)
+    assert isinstance(parsed, str) and parsed.endswith("+00:00")

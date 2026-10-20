@@ -157,6 +157,12 @@ const SHELL_PAGE = {
 
 const config = defineConfig({
   base: "/",
+  // Vite 8 mints a fresh random HMR websocket token on every dev-server start,
+  // so any tab still holding a pre-restart bundle fails the handshake with
+  // "Unexpected response code: 400" until it is reloaded manually. The dev
+  // server is localhost-only, so skip the token check and let stale tabs
+  // reconnect cleanly.
+  legacy: { skipWebSocketTokenCheck: true },
   resolve: { tsconfigPaths: true },
   optimizeDeps: {
     include: [

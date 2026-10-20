@@ -47,7 +47,7 @@ def apply() -> None:
     else:
         from fake_llm import FakeScriptedChatModel, build_script
 
-        def _fake_make_model(model_id: str, **kwargs: object):  # noqa: ARG001
+        async def _fake_make_model(model_id: str, **kwargs: object):  # noqa: ARG001
             return FakeScriptedChatModel(script=build_script())
 
         server.make_model = _fake_make_model

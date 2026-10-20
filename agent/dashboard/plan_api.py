@@ -5,12 +5,12 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from langgraph_sdk import get_client
 from langgraph_sdk.schema import Run
 from pydantic import BaseModel
 
 from ..dispatch import dispatch_agent_run
 from ..utils.slack import post_slack_thread_reply
+from ..utils.thread_ops import langgraph_client
 from .oauth import require_same_origin_for_mutations, require_session
 from .plan_store import (
     PLAN_STATUS_APPROVED,
@@ -60,7 +60,7 @@ class PlanRejection(BaseModel):
 
 
 async def _thread_metadata(thread_id: str) -> dict[str, Any]:
-    client = get_client()
+    client = langgraph_client()
     try:
         thread = await client.threads.get(thread_id)
     except Exception as exc:  # noqa: BLE001

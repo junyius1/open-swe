@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException
-from langgraph_sdk import get_client
+from ..utils.thread_ops import langgraph_client
 from pydantic import BaseModel, Field, field_validator
 
 SKILLS_NAMESPACE = "user_skills"
@@ -58,7 +58,7 @@ class SkillUpdate(BaseModel):
 
 
 def _client():
-    return get_client()
+    return langgraph_client()
 
 
 def _namespace(login: str) -> list[str]:

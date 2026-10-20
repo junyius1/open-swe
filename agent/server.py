@@ -18,6 +18,32 @@ from typing import Any, Literal, cast
 
 logger = logging.getLogger(__name__)
 
+# 针对 langgraph_sdk 中的 _ReadRuntime 和 _WriteRuntime 进行正确的 monkeypatch
+try:
+    from langgraph_sdk.runtime import _ReadRuntime
+
+    if not hasattr(_ReadRuntime, "override"):
+
+        def _dummy_override(self, *args, **kwargs):
+            return self
+
+        _ReadRuntime.override = _dummy_override
+        logger.info("Successfully monkeypatched langgraph_sdk.runtime._ReadRuntime.override")
+except Exception:
+    logger.warning("Failed to monkeypatch langgraph_sdk.runtime._ReadRuntime.override")
+
+try:
+    from langgraph_sdk.runtime import _WriteRuntime
+
+    if not hasattr(_WriteRuntime, "override"):
+
+        def _dummy_override(self, *args, **kwargs):
+            return self
+
+        _WriteRuntime.override = _dummy_override
+except Exception:
+    pass
+
 from langgraph.graph.state import RunnableConfig
 from langgraph.pregel import Pregel
 from langgraph.runtime import Runtime
@@ -111,6 +137,7 @@ from .middleware import (
     SanitizeThinkingBlocksMiddleware,
     SanitizeToolInputsMiddleware,
     StableToolResultOrderMiddleware,
+    StripThoughtsMiddleware,
     SubdirAgentsReadMiddleware,
     TimeoutWrapupMiddleware,
     ToolErrorMiddleware,
@@ -816,7 +843,7 @@ def _subagent_model_middleware() -> list[AgentMiddleware[Any, Any, Any]]:
     """
     return cast(
         list[AgentMiddleware[Any, Any, Any]],
-        [SanitizeOpenAIResponsesMiddleware(), ModelCallTimeoutMiddleware()],
+        [SanitizeOpenAIResponsesMiddleware(), StripThoughtsMiddleware(), ModelCallTimeoutMiddleware()],
     )
 
 
@@ -1159,14 +1186,14 @@ def _slack_tools_enabled(configurable: dict[str, Any]) -> bool:
     )
 
 
-def _make_model_or_defer(
+async def _make_model_or_defer(
     model_id: str,
     *,
     use_gateway: bool,
     **kwargs: Any,
 ) -> BaseChatModel:
     try:
-        return make_model(model_id, use_gateway=use_gateway, **kwargs)
+        return await make_model(model_id, use_gateway=use_gateway, **kwargs)
     except Exception as e:  # noqa: BLE001
         logger.warning("Deferring model setup failure for %s", model_id, exc_info=True)
         return make_deferred_error_model(e, model_id=model_id)
@@ -1560,7 +1587,9 @@ async def get_agent(config: RunnableConfig) -> Pregel:
             fallback_kwargs["reasoning"] = DEFAULT_LLM_REASONING
         fallback_middleware.append(
             ModelFallbackMiddleware(
-                _make_model_or_defer(fallback_model_id, use_gateway=use_gateway, **fallback_kwargs)
+                await _make_model_or_defer(
+                    fallback_model_id, use_gateway=use_gateway, **fallback_kwargs
+                )
             )
         )
         logger.info("Configured model fallback %s -> %s", model_id, fallback_model_id)
@@ -1709,8 +1738,8 @@ async def get_agent(config: RunnableConfig) -> Pregel:
             )
             skill_sources.insert(0, USER_SKILLS_ROUTE)
     agent_backend = CompositeBackend(default=backend, routes=skill_routes)
-    main_model = _make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs)
-    subagent_model = _make_model_or_defer(
+    main_model = await _make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs)
+    subagent_model = await _make_model_or_defer(
         subagent_model_id,
         use_gateway=use_gateway,
         **subagent_model_kwargs,
@@ -1720,7 +1749,7 @@ async def get_agent(config: RunnableConfig) -> Pregel:
         for tool in static_tools
         if tool is not background_execute and tool is not background_task
     ]
-    title_model = _make_model_or_defer(
+    title_model = await _make_model_or_defer(
         title_model_id,
         use_gateway=use_gateway,
         **title_model_kwargs,
@@ -1792,6 +1821,7 @@ async def get_agent(config: RunnableConfig) -> Pregel:
                 SanitizeFireworksMessagesMiddleware(),
                 SanitizeOpenAIResponsesMiddleware(),
                 SanitizeThinkingBlocksMiddleware(),
+                StripThoughtsMiddleware(),
                 StableToolResultOrderMiddleware(),
                 # Innermost, so the deadline covers the provider call itself and a
                 # timeout escalates outward to the fallback model.

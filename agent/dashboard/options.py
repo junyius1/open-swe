@@ -17,6 +17,13 @@ class ModelOption(TypedDict):
 
 SUPPORTED_MODELS: list[ModelOption] = [
     {
+        "id": "local:/mnt/D/models/Qwen3.8-27B",
+        "label": "Local Qwen3.8 27B (llama.cpp)",
+        "efforts": ["none"],
+        "default_effort": "none",
+        "supports_images": False,
+    },
+    {
         "id": "anthropic:claude-opus-5",
         "label": "Opus 5",
         "efforts": ["low", "medium", "high", "xhigh", "max"],
@@ -216,7 +223,8 @@ def gate_fable_model(
     return model_id, effort
 
 
-DEFAULT_MODEL_ID: str = "openai:gpt-5.6-sol"
+# DEFAULT_MODEL_ID: str = "openai:gpt-5.6-sol"
+DEFAULT_MODEL_ID: str = "local:/mnt/D/models/Qwen3.8-27B"
 DEFAULT_MODEL_EFFORT: str = "medium"
 
 
