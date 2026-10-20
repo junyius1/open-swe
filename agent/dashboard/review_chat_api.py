@@ -27,6 +27,7 @@ from .options import SUPPORTED_MODEL_IDS, canonical_model_pair, model_supports_e
 from .review_api import classify_finding, get_pr_head_sha, get_review, reviewer_thread_id
 from .thread_api import (
     _DASHBOARD_STREAM_MODES,
+    _DISCOVERY_HISTORY_LIMIT,
     _langgraph_proxy_headers,
     _require_json_content_type,
     _stream_thread_events,
@@ -534,8 +535,21 @@ async def proxy_review_chat_history(
 ) -> tuple[int, bytes, str | None]:
     await assert_chat_thread_access(thread_id, owner, repo, pr_number, login)
     _require_json_content_type(content_type)
+    try:
+        payload = json.loads(body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(400, "history body must be a JSON object") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "history body must be a JSON object")
+    limit = payload.get("limit", _DISCOVERY_HISTORY_LIMIT)
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise HTTPException(400, "history limit must be a positive integer")
+    # Unfiltered discovery reads get the same clamp as the agent-thread proxy:
+    # a full checkpoint walk on an oversized thread can block the runtime loop.
+    if not any(payload.get(key) for key in ("before", "checkpoint", "metadata")):
+        payload["limit"] = min(limit, _DISCOVERY_HISTORY_LIMIT)
     status_code, content, media_type = await _proxy_passthrough(
-        "POST", thread_id, "history", body, content_type
+        "POST", thread_id, "history", json.dumps(payload).encode(), content_type
     )
     # The thread is created lazily on the first run; before then, hydration
     # history reads hit a missing thread. Return an empty list so the SDK
