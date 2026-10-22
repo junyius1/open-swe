@@ -75,6 +75,7 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
     "ttl": { "strategy": "delete", "sweep_interval_minutes": 60, "default_ttl": 43200 }
   },
   "store": { "path": "agent/postgres_persistence.py:create_store" },
+  "webhooks": { "url": { "disable_loopback": false } },  // 完成 webhook 走进程内 loopback(§8.1)
   "env": ".env"
 }
 ```
@@ -112,7 +113,8 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
 差异:
 - `dispatch_agent_run` 的 `source` 只可能是 `web`/`desktop`/`automation`(Slack/Linear/GitHub 不再作为触发源)。`_dispatch_input` 里抽 Slack user/channel/时区、GitHub login、Linear email 的逻辑**删除**,发送者身份退化为本地身份(§2)。
 - `build_run_input` 的 people/channels/systems 注入保留框架,但 `PersonIdentity` 不再来自 GitHub/Slack 映射;dashboard 来源直接给一个 `local-user` 的 `<dynamic-context>`。
-- 完成 webhook 地址解析的 **fail-closed 逻辑保留**(loopback/相对 URL 降级为不挂 + 告警)——这是 inmem 的硬约束,与 GitHub 无关。
+- **触发 webhook(slack/linear/github)全部删除**——它们本来就是外部平台 POST 进来的,本地没有外部平台。本地触发源只有 dashboard 表单(同步 `run.start`)与 `scheduler`(cron),两者都**不经过任何 webhook**。
+- 完成 webhook 的投递方式**改为进程内 loopback**(见 §8):上游"相对/loopback URL 会 422、必须 absolute https"的约束,在本地版通过官方策略开关 `webhooks.url.disable_loopback=false` **合法解除**;`dispatch.py` 的 fail-closed 逻辑相应改写。
 
 ---
 
@@ -143,7 +145,23 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
 
 `agent/completion.py` + `/webhooks/run-complete` 的**幂等骨架保留**(`verify_run_complete_token` fail-closed、按 `run_id` 去重、按 `kind` 收尾)。
 
-差异:
+### 8.1 投递方式:进程内 loopback(本地版关键差异)
+上游部署里 `COMPLETION_WEBHOOK_URL` 必须是**公网 absolute https URL**——因为 inmem 运行时(`langgraph_api/webhook.py`)**默认** `disable_loopback=true`,相对/localhost webhook 会在 `runs.create` 时 422(防 auth-bypass,GHSA-q3v5-r5ch-p57j:loopback 走进程内 ASGI transport,挂载在 `root_path="/noauth"`,绕会话认证)。
+
+本地版**不需要公网 URL**,走官方策略开关:
+```jsonc
+// langgraph.json 追加
+"webhooks": { "url": { "disable_loopback": false } }
+```
+(CLI 启动时序列化为 `LANGGRAPH_WEBHOOKS` env,`config/__init__.py` 的 `WEBHOOKS_CONFIG` 读取。)开启后,**相对 URL 经进程内 loopback client 直接 POST 到本进程的同一 FastAPI app**——不走网络、不暴露端口、无 https 要求。
+
+配套改动:
+- `COMPLETION_WEBHOOK_URL=/webhooks/run-complete`(改回**相对路径**;secret 仍必须设置,拼 `?token=`)。
+- `dispatch.py` 的 `_is_loopback_webhook` 降级逻辑**反转**:loopback 策略已开启时,相对 URL **正常挂**;secret 未设时仍不挂(路由本身 fail-closed 503)。
+- **token 校验不可省**:loopback 投递恰好绕过会话认证,`verify_run_complete_token` 是这条路由唯一的门。
+- 验收:run 终结后,`/webhooks/run-complete` 收到进程内 POST 且 `?token=` 正确;用错误 token 调同路由得 401/403。
+
+差异(业务层):
 - `success` → 不再入队 Slack 成本刷新(§4.2 已删 `session_cost`),改为无操作或仅记日志。
 - 终态失败 → `_post_failure_reply` 简化:不往 Slack/PR 发,改为**落一条 thread 级失败标记**到 thread metadata(store),dashboard 线程列表可见。`_settle_failed_reviewer_check` 删除(reviewer 没了)。
 
@@ -200,8 +218,8 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
 DATABASE_URI=postgres://…            # 缺失则 InMemory 降级 + 告警
 # 模型(多 provider 任选其一,make_model 解析)
 ANTHROPIC_API_KEY=…                  # 或 OPENAI_*/FIREWORKS_*/gateway
-# 完成 webhook(fail-closed;loopback 会自动降级为不挂)
-COMPLETION_WEBHOOK_URL=http://localhost:2024/webhooks/run-complete
+# 完成 webhook(相对路径 → 进程内 loopback 投递,§8.1;token 必填)
+COMPLETION_WEBHOOK_URL=/webhooks/run-complete
 RUN_COMPLETE_WEBHOOK_SECRET=…
 # 认证(§2)
 OPEN_SWE_LOCAL_AUTH_TOKEN=…          # 未设则要求 OPEN_SWE_ALLOW_ANON=1
@@ -227,7 +245,7 @@ OPEN_SWE_QUEUE_DEBUG=1
 **最小复刻验收(本变体)**:
 - [ ] `langgraph.json` 仅 `agent` + `scheduler` + `http.app` + Postgres checkpointer/store + TTL 可启动
 - [ ] `pin_single_event_loop` 在 import 期生效且可拒绝启动
-- [ ] `dispatch_agent_run` 六参数契约 + 完成 webhook 幂等(**无** GitHub 触发源)
+- [ ] `dispatch_agent_run` 六参数契约 + 完成 webhook 幂等(**无** GitHub 触发源);`disable_loopback=false` 下 run 终结经**进程内** POST 到达 `/webhooks/run-complete`(`?token=` 错误 → 401/403),全程无公网回调
 - [ ] 静态 token 认证:带 token 200 / 缺 token 401;开放本地模式仅在 `OPEN_SWE_ALLOW_ANON=1` 生效
 - [ ] 沙箱 `SANDBOX_TYPE=local`,无 GitHub token 注入;`git config user.name/email` 未被强制覆盖(commit 作者 = 宿主身份)
 - [ ] 一次 `agent` run 能:改文件 → `git commit` 到 `local/<slug>` 分支 → 汇报本地分支名,**不** push、**不**建 PR
