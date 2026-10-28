@@ -181,7 +181,7 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
 | health(`api/health.py`、queue-probe) | `agent_usage.py`(PR 用量)、`repo_cache.py`、`repo_snapshots.py`、`enabled_repos.py`、`user_mappings.py` 的 GitHub 映射 |
 | `health_router`、`run-complete` webhook | `slack_webhook_router`、`linear_webhook_router`、`github_webhook_router` |
 
-`state/history` 代理的**有界 + 合并 + 退避三层防御**(90s/15s/30s 超时、`_DISCOVERY_HISTORY_LIMIT=5`、`_FALLBACK_ATTEMPTS=3`、30s 快照缓存、32 合并)**逐字保留**——这是单循环性能事故的防线,与 GitHub 无关。
+`state/history` 代理的**有界 + 合并 + 退避三层防御**(90s/15s/30s 超时、`_DISCOVERY_HISTORY_LIMIT=5`、`_FALLBACK_ATTEMPTS=3`、30s 快照缓存、32 合并)**逐字保留**——这是单循环性能事故的防线,与 GitHub 无关。逐端点的请求/响应契约见 §15.2-B。
 
 ### 9.3 前端契约
 前端 hydrate 仍用 `GET /state`(主 transcript)+ 有界 history 发现页,`VITE_DASHBOARD_API_BASE_URL` 指向 `:2024` 的 `/dashboard/api`;**删除**所有 PR/review/OAuth 页与组件,只留 Agents 线程列表 + 聊天 + plan 审批。
@@ -275,3 +275,217 @@ OPEN_SWE_QUEUE_DEBUG=1
 4. **接完成 webhook**(§8)+ `scheduler` 裁剪(§4.2)。
 5. **提示词收尾**(§10)+ env 清单(§11)。
 6. **逐条过 §12 验收清单**,尤其"超大线程不冻结"与"内存无 GitHub 凭据"两条。
+
+---
+
+## 15. 实现清单:路由 / Webhook / HTTP 字段盘点
+
+> 本节是**可直接照做的实现契约**:§15.1 是"运行时免费提供、只需调用"的协议路由(含字段级契约);§15.2 是"必须自己实现"的 dashboard 路由(按活服务抓取的 92 端点逐条归类:留/改/删);§15.3 是 webhook 端点;§15.4 是贯穿所有端点的 HTTP 协议字段。
+> 基线:活服务 `:2024` OpenAPI(148 paths = 92 dashboard + 56 协议/其他)。
+
+### 15.1 协议路由(`langgraph_api` 提供,不实现,只消费)
+
+**不需要写的代码**:起 `langgraph dev` 即全部就位。列出实际被用到的子集与契约,实现 dashboard 侧时按这些字段调。
+
+**threads(核心)**
+
+| 端点 | 用途 | 请求/响应契约 |
+|---|---|---|
+| `POST /threads` | 建线程 | body:`{"thread_id"?: uuid, "metadata": {…业务字段…}}`;resp:`{"thread_id", "created_at", …}` |
+| `GET /threads/{id}` | 取线程 | resp 含 `thread_id/status/metadata/created_at/updated_at` |
+| `PATCH /threads/{id}` | 改 metadata | body:`{"metadata": {…}}`(merge 语义) |
+| `DELETE /threads/{id}` | 删线程(+其 checkpoint) | 200/204 |
+| `POST /threads/search` | 按 metadata 过滤搜线程 | body:`{"metadata": {"kind": …, "github_login": …}, "limit", "offset", "sort_by": "updated_at", "sort_order": "desc"}`;resp:`[thread…]` |
+| `GET /threads/{id}/state` | **单快照读**(主 transcript 来源) | query 可选 `subgraphs`;resp:ThreadState = `{"values": {…state 通道,含 messages…}, "next": […], "configurable": {"thread_id", "checkpoint_id", "checkpoint_ns"}, "metadata": {…}}` |
+| `GET /threads/{id}/history` | 有界历史 | query:`limit` / `before` / `after` / `filter`;resp:`[{checkpoint_id, parent_checkpoint_id, values, metadata, timestamp, next}, …]` |
+| `POST /threads/{id}/history` | 同上的 POST 形式 | body 同上字段 |
+| `GET /threads/{id}/stream` | **SSE join 线程流** | query:`last_event_id`(重连续播)、`stream_mode`;SSE 帧,可断线重放(`stream_resumable`) |
+| `POST /threads/{id}/stream/events` | **v2 事件流**(前端 `StreamProvider` 主消费口) | body 同 stream 参数;SSE,v3 协议(由 `__event_streaming_v2` 标记启用,含 tools/lifecycle 通道) |
+
+**runs(触发契约,§5/§6 的落地字段)**
+
+| 端点 | 用途 |
+|---|---|
+| `POST /threads/{id}/runs` | **建 run(durable 触发)**——`create_durable_run` 就是打这里 |
+| `POST /threads/{id}/runs/stream` | 建 run 并直接 SSE 流 |
+| `POST /threads/{id}/runs/wait` | 建 run 并同步等到终态 |
+| `GET /threads/{id}/runs` | 列 runs(query `limit`) |
+| `GET /threads/{id}/runs/{run_id}` / `DELETE` | 查/删 run |
+| `POST /threads/{id}/runs/{run_id}/cancel` | 取消 run |
+| `GET /threads/{id}/runs/{run_id}/stream` | 单 run SSE join(query `last_event_id`、`stream_mode`) |
+| `POST /threads/{id}/commands` | **SDK command 信封**(见 §15.4.4)——dashboard 消息注入走这里 |
+| `POST /threads/{id}/runs/crons` 及 `POST/GET/PATCH/DELETE /runs/crons…` | **cron 面**——`scheduler` 图所有定时任务(`reconcile`/`background_tasks`/用户 Automations)都经这套创建/查询 |
+
+**`POST /threads/{id}/runs` 的 body 契约(复刻必须逐字段一致)**:
+
+```jsonc
+{
+  "input": {"messages": [RunMessage], "files": {…?}},   // §5 的 XML 信封
+  "config": {"configurable": {…见 15.4.3…}, "recursion_limit"?},
+  "metadata": {"kind": "agent", "source": "dashboard|web|automation|schedule",
+               "local_user": "…", "repo": "…", "title": "…", "latest_run_id"? …},
+  "multitask_strategy": "interrupt",          // 后台 follow-up 可 "enqueue"
+  "durability": "sync",
+  "if_not_exists": "create",
+  "stream_mode": ["values","updates","messages","custom","tasks","checkpoints"],
+  "stream_subgraphs": true,
+  "stream_resumable": true,
+  "webhook": "/webhooks/run-complete?token=…",  // 仅 secret 已设时
+  "after_seconds": null                        // 可选延迟
+}
+```
+resp(200/202):`{"run_id", "thread_id", "status", "created_at", …}`。
+
+**store(长期记忆,`AsyncPostgresStore`)**:`PUT/GET/DELETE /store/items`(body `{"namespace": […], "key": str, "value": {…}}`)、`POST /store/items/search`、`POST /store/namespaces`。
+
+**其余协议端点**(`assistants/*`、`/mcp/`、`/a2a/*`、`/store/namespaces`、`/runs/stream|wait|batch|cancel` 无线程形态):**不用**,不消费、不管。
+
+**SSE 兼容性验收标准**(不逐帧抄 schema):前端 `@langchain/react` 的 `StreamProvider`/`StreamController` 与 Python 侧 `langgraph-sdk 0.4.2` 都能无感消费;`stream_resumable=True` 的 run 在晚连接/断线后用 `last_event_id` 重放;子代理事件带命名空间(`stream_subgraphs`)。
+
+### 15.2 必须实现的 dashboard 路由(`/dashboard/api/*`)
+
+基线 92 端点。**留**=原样移植(字段照抄现有实现);**改**=换认证/换判据;✂️=删除(依赖 GitHub/PR/Slack/Linear/review/团队多用户)。
+
+**A. 认证(改)**
+
+| 端点 | 处理 | 契约 |
+|---|---|---|
+| `GET /auth/login`、`GET /auth/callback`、`POST /auth/logout`、`POST /auth/desktop/exchange`、`GET /slack/login`、`GET /slack/callback`、`GET /notion/login`、`GET /notion/callback` | **全部删除**,替换为: | — |
+| `GET /auth/token-login`(新增) | 静态 token 换会话 cookie | query `token`;校验 `OPEN_SWE_LOCAL_AUTH_TOKEN`(`hmac.compare_digest`)→ 下发 `osw_session`(HMAC 签名,含 `identity="local-user"`、过期时间);错/缺 → 401。未设 token 且 `OPEN_SWE_ALLOW_ANON=1` → 直接发 `anon` 会话 |
+| `GET /me`、`GET/PUT/DELETE /me/instructions`、`GET/PUT /profile` | **留**(判据改本地身份) | `/me` resp:`{"sub": "local-user", "email"?: null, "name": "local-user", "admin": true}`;`/me/instructions` body 任意文本(用户级指令,§跨线程共享面) |
+| `GET /my-mapping`、`GET/DELETE /admin/user-mappings*`、`GET /repos`、`GET /team-credentials*`、`GET/PUT /team-settings*`、`PUT /team-settings/transcription`、`GET/PUT/DELETE /my-credentials/*`(currents/langsmith/notion) | ✂️ 删 | — |
+
+**B. 线程核心(留,变体主战场)**
+
+| 端点 | 契约(请求 → 响应) |
+|---|---|
+| `GET /threads` | query:`limit(≤100, 默认25)`、`offset`、`resolved?`、`viewed?`、`source?`、`status?`、`query?`(模糊)、`scope=all\|interactive\|automation`、`automation_id?`、`sort_by=updated_at\|created_at`。实现:对 `POST /threads/search` 加 `metadata.local_user` 过滤(单用户下恒真)分页封装。resp:`{"items": [ThreadListItem], "limit", "offset", "hasMore": bool}` |
+| `GET /threads/page`、`GET /threads/sidebar` | 同上的变体(分页/侧栏精简字段);留 |
+| `GET /threads/{id}` | **元数据详情**(transcript 不在这——前端另调 `/state` hydrate)。resp:`ThreadListItem` 全字段 + `{"isOwner": true, "status", "latest_run_id"?, "links": {"web","plan"?,"trace"?}}`;404 归一化:非本用户线程 → 404(变体下恒真放行) |
+| `ThreadListItem` 字段 | `id, title, repo, repoFullName, branch, model, effort, planMode, planStatus, adminThread, source, origin, threadCategory, triggerKind, automationId?, automationName?, status(idle\|running\|error\|interrupted), viewed, viewedAt, createdAt, updatedAt, lastUserMessage?` |
+| `DELETE /threads/{id}` | 删线程 + 其 checkpoint/流;resp 200/204 |
+| `POST /threads/{id}/resolve` | body `{"resolved": bool}` → metadata 打标;resp 更新后的列表项 |
+| `POST /threads/{id}/cancel` | 取消当前 run(经 `runs/{id}/cancel`);resp `{"cancelled": bool}` |
+| `POST /threads/{id}/runs/{run_id}/cancel` | 同上,指定 run |
+| `POST /threads/{id}/messages` | **发消息=触发 run**。body(`ThreadMessageBody`):`{"content": str(≤20000), "images": [{data, media_type, filename?}], "model_id"?, "effort"?, "plan_mode": bool}`。实现:构造 `build_run_input` 信封(source=`web`,sender=本地身份)→ `dispatch_agent_run` → `create_durable_run`(§15.1 runs 契约)→ resp:`{"run_id", "thread_id", "queued": bool}` |
+| `POST /threads/{id}/commands` | **SDK command 信封透传 + 富化**(见 §15.4.4):raw JSON body;服务端在 `run.start` 时注入 `configurable`(`local_user`、`repo`、`plan_mode`、`prepare_run_id`、模型覆盖)与 `metadata`(`source="dashboard"`)→ POST 到运行时 `/threads/{id}/commands` → 回传响应(`{"type":"success","run_id"?}` / `{"type":"error","error":…}`);404 归一化:线程不存在且 method≠run.start → 404 |
+| `POST /threads/{id}/history` | **有界代理**:raw body(`{"limit"?, "before"?, …}`)→ 无过滤时 `limit` 强制 ≤5(`_DISCOVERY_HISTORY_LIMIT`)→ 90s 预算 → 失败退避(`{limit:1}` 重试 3 次 ×1.5s → 降级单快照)→ resp 透传运行时 history 数组;超时 → **503** `{"detail": "thread history request timed out; retry"}` |
+| `GET /threads/{id}/state` | **有界代理**:15s 预算单快照 → resp 透传 ThreadState;线程不存在/从未 run 的归一化:`{"values": {}, "next": []}`;超时 → 503 |
+| `GET /threads/{id}/stream` | **SSE 透传** join 线程流:上游 `GET /threads/{id}/stream`(带 `last_event_id`),权限校验后字节流回传;客户端断开必须释放上游订阅(流订阅回收) |
+| `POST /threads/{id}/stream/events` | **SSE 透传** v2 事件流(前端 `StreamProvider` 主口);同上回收语义 |
+
+**C. Plan(留,4+3 端点)**
+
+`GET/PUT /plan/{thread_id}`(body `{"content", "content_format": "html"|"markdown"}`)、`POST …/approve`、`POST …/reject`、`GET/POST /plan/{thread_id}/comments`(body `{"content"}`)、`DELETE …/comments/{comment_id}`。存储:store 命名空间 `plans`;approve/reject 只是状态翻转,审批动作由**前端**在收到 approve 后发 `run.start`(带 `plan_mode=false`)——服务端不自动跑。
+
+**D. Workflow 审批(留)**
+
+`GET /workflow-approval/{thread_id}`(resp `{"approvals": [{fingerprint, message, status, created_at}]}`)、`POST …/{fingerprint}/approve`、`POST …/{fingerprint}/reject`。存储:thread metadata(`workflow_approvals`);`POST /threads/{id}/commands` 的 `run.start` 若命中 pending 审批由前端先走这里。
+
+**E. Automations/schedules(留,4 端点)**
+
+`GET /schedules`(query `limit/offset`;resp 列表 `[{id, name, cron, prompt, enabled, next_fire_at, last_result?}]`)、`POST /schedules`(body `{"name", "cron", "prompt", "enabled"}`)→ 建 cron(`POST /runs/crons` 打 `scheduler` 图,`task` 缺省 = 定时 agent run)、`PATCH/DELETE /schedules/{id}`、`POST /schedules/{id}/trigger`(立即触发一次)。
+
+**F. Skills / repo instructions(留)**
+
+`GET/POST /skills`、`PUT/DELETE /skills/{name}`(用户技能,store);`GET/POST /organization-skills`、`PUT/DELETE …/{name}`(组织技能,本地单用户可并入用户技能或保留双命名空间);`GET/POST /agent-instructions`、`GET/PUT/DELETE /agent-instructions/{full_name}`(per-repo 指令,注入系统提示)。
+
+**G. 模型选项(留)**:`GET /options` → `{"models": [{id, label, effort_options[]}]}`(来自 `SUPPORTED_MODEL_IDS`)。
+
+**H. Health/debug(留)**:`GET /health` → `{"status":"healthy"}`、`GET /ok` → 200、`GET/POST /debug/queue-probe`(事件循环 lag 探针,`OPEN_SWE_QUEUE_DEBUG=1` 时有数据;resp `{"lag_ms", "loop_thread", …}`)——§12 验收"不冻结 >1s"就靠它。
+
+**I. 可选留(本地 git 相关,默认不做,需要时加回)**
+
+`GET /threads/{id}/working-tree-diff`(沙箱内 `git diff` 物化,供前端 diff 面板;纯本地能力,不依赖 GitHub)、`GET /threads/{id}/branch-diff`。`GET /threads/{id}/terminal/connect` ✂️ 删(桌面终端)。
+
+**J. 删除清单(✂️,共 60 端点)**
+
+`/admin/*`(evals/threads cancel/user-mappings)、`/reviews/*` 全部(含 `…/chat*` 8 个 PR 聊天代理)、`/review-styles/*`、`/enabled-review-repos`、`/repo-snapshots*`、`/sandbox-settings`、`/environments*`、`/voice/*`、`/agent-usage-leaderboard`、`/threads/{id}/{pr-diff, pull-request-status, recovery.patch}`、A 节所列全部 OAuth/凭据/团队端点。
+
+### 15.3 Webhook 端点
+
+| 端点 | 方向 | 处理 |
+|---|---|---|
+| `POST /webhooks/run-complete?token=…` | 运行时 →(loopback 或真实网络)→ 本服务 | **留,唯一保留的 webhook**。鉴权:`token` query 与 `RUN_COMPLETE_WEBHOOK_SECRET` 比对(`hmac.compare_digest`);secret 未设 → **503**(fail-closed);token 错 → 401。body 见 §15.4.5。处理:`handle_run_completion`——按 `run_id` 幂等;`status=success` → 记日志;失败态 → 按 `thread_id` 取 metadata,落 `failure_ack` 标记 + `latest_run_status`,resp `{"status": "handled"|"deduped"}` |
+| `POST /webhooks/github`、`GET/POST /webhooks/slack`、`POST /webhooks/slack/interactivity`、`GET/POST /webhooks/linear` | 外部平台 → 本服务 | ✂️ **全删**(§0/§5;无 GitHub/Slack/Linear 触发源) |
+
+### 15.4 HTTP 协议字段盘点
+
+**15.4.1 认证与通用头**
+- 协议面(`:2024` 非 `/dashboard/api` 路由):`Authorization: Bearer <OPEN_SWE_LOCAL_AUTH_TOKEN>`(接 `agent/local_auth.py` 的 `Auth.authenticate`,身份 `local-user`);
+- dashboard 面:会话 cookie `osw_session`(§15.2-A 下发,`HttpOnly`、`SameSite=Lax`、`Path=/`);跨 origin 时 CORS:`Access-Control-Allow-Credentials: true` + 具体 origin 白名单(`DASHBOARD_ALLOWED_ORIGINS`;**禁止 `*`+credentials**);
+- 全部 JSON 端点:`Content-Type: application/json`(proxy 端点显式校验,非 JSON → 415);
+- 404 归一化:非 owner/不存在的线程一律 404(不泄漏存在性);503 仅用于"有界读超时"(body `{"detail": "… timed out; retry"}`)。
+
+**15.4.2 线程 metadata 契约(thread jsonb,业务状态的唯一载体)**
+
+```jsonc
+{
+  "kind": "agent",                  // 变体恒为 agent(不再有 reviewer/review_chat/…)
+  "local_user": "local-user",       // owner 判据(替代 github_login)
+  "source": "dashboard|web|automation|schedule",
+  "repo": {"owner"?, "name"},       // 解析自消息 repo: 语法或 /repos 配置
+  "title": str,
+  "status": "idle|running|error|interrupted",  // 展示态,由 latest_run_status 推导
+  "latest_run_status": "pending|running|success|error|timeout|interrupted",
+  "latest_run_id": str,
+  "viewed": bool, "viewed_at_ms": int,
+  "resolved": bool,
+  "branch": str,                    // 线程稳定分支名(local/<slug>)
+  "model": str, "effort"?: str, "plan_mode": bool, "plan_status"?: str,
+  "sandbox_id"?: str,               // 沙箱注册表键(仅运行时进程内有效)
+  "failure_ack_run_ids"?: [str],    // 完成 webhook 幂等去重
+  "prepared_run_ids"?: [str]
+}
+```
+
+**15.4.3 `configurable` 契约(runs/commands 的 `config.configurable`)**
+
+| 键 | 值 | 说明 |
+|---|---|---|
+| `thread_id` | uuid | 恒有 |
+| `source` | `dashboard\|web\|automation\|schedule` | 决定 Surface 与提示分段 |
+| `local_user` | `"local-user"`(或 `anon`) | 替代 `github_login` |
+| `repo` | `{"owner","name"}` | 可缺 |
+| `agent_model_id` / `agent_effort` | str | 用户选模型(缺省走团队/全局默认) |
+| `plan_mode` | bool | plan mode 开关 |
+| `prepare_run_id` | 新 uuid(每次 run) | PrepareRun 中间件关联 |
+| `__event_streaming_v2` | `true` | **必须置位**(v3 流协议标记,镜像 langgraph_api 的 key,不 import) |
+| `sandbox_id` | str | 复用线程沙箱 |
+
+**15.4.4 SDK command 信封(`POST /threads/{id}/commands` 的 body)**
+
+```jsonc
+// 前端(@langchain/react)发送:
+{ "id": "cmd-<uuid>", "method": "run.start" | "input.respond" | "input.inject" | "state.fork",
+  "params": {
+    "input"?: {"messages": [RunMessage]},          // run.start 的消息
+    "config"?: {"configurable": {…用户可选字段…}},
+    "metadata"?: {…},
+    "stream_mode"?: […], "stream_subgraphs"?: bool
+  } }
+// 服务端富化后透传;运行时响应:
+{ "type": "success", "run_id"?: str } | { "type": "error", "error": {…} }
+```
+
+**15.4.5 run-complete webhook 的 body 契约**(运行时 `call_webhook` 组装;字段全集 = `allowed_fields` 白名单)
+
+```jsonc
+{
+  "run_id": str, "thread_id": str, "assistant_id": "agent",
+  "created_at": iso8601, "updated_at": iso8601,
+  "metadata": {…thread/run metadata…},
+  "kwargs": {"input": …, "config": …, …},
+  "multitask_strategy": "interrupt",
+  "status": "success" | "error" | "timeout",
+  "run_started_at": iso8601, "run_ended_at": iso8601, "webhook_sent_at": iso8601,
+  "values": {…最终 state(含 messages)…} | null,     // 最大字段;可在 webhooks.allowed_fields 裁掉
+  "error": {"error": str, "message": str}           // 仅失败时
+}
+```
+
+**15.4.6 SSE 事件流(GET/POST `…/stream*` 的响应)**
+- `Content-Type: text/event-stream`;帧 `id: <event_id>\nevent: <type>\ndata: <json>\n\n`;
+- 通道:`values`/`updates`/`messages`/`custom`/`tasks`/`checkpoints`(v2 标记下另含 tools/lifecycle 与子代理命名空间事件);
+- 断线重连:客户端带 `Last-Event-ID` 头(或 `last_event_id` query)→ 服务端从该 event 重放(依赖 `stream_resumable=True`);
+- **验收口径**:用 `langgraph-sdk 0.4.2` 的 `client.runs.stream` 与前端 `StreamProvider` 双端消费通过,不逐帧比对 schema。
