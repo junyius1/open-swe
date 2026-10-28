@@ -282,6 +282,8 @@ OPEN_SWE_QUEUE_DEBUG=1
 
 > 本节是**可直接照做的实现契约**:§15.1 是"运行时免费提供、只需调用"的协议路由(含字段级契约);§15.2 是"必须自己实现"的 dashboard 路由(按活服务抓取的 92 端点逐条归类:留/改/删);§15.3 是 webhook 端点;§15.4 是贯穿所有端点的 HTTP 协议字段。
 > 基线:活服务 `:2024` OpenAPI(148 paths = 92 dashboard + 56 协议/其他)。
+>
+> **图例(功能列首位彩色图标)**:🔐 鉴权 · ⚡ 触发 run · 📖 读 · ✏️ 写 · 🗑️ 删 · 🔍 搜索 · 📜 历史 · 📡 SSE 流 · 🔁 有界代理 · ✅ 批准/标记 · ❌ 拒绝 · 🛑 取消 · ⏰ 定时任务 · 🧩 技能/指令 · 🎛️ 配置选项 · 🩺 健康/调试 · 🔔 完成 webhook · 📝 plan · 🚦 推送审批 · 🌿 git diff · 📐 结构定义。功能列**加粗**=核心动作,*斜体*=必须注意的语义。
 
 ### 15.1 协议路由(`langgraph_api` 提供,不实现,只消费)
 
@@ -291,31 +293,31 @@ OPEN_SWE_QUEUE_DEBUG=1
 
 | 端点 | 功能 | 请求 / 成功响应 | 失败定义 |
 |---|---|---|---|
-| `POST /threads` | 建线程记录(业务状态的容器;可指定 id 便于确定性命名) | body `{"thread_id"?: uuid, "metadata": {…}}` → **200** thread 对象 | 400 body 非法;id 已存在且 metadata 冲突 → 409 |
-| `GET /threads/{id}` | 取线程记录(metadata 读取/权限判断的数据源) | → **200** `{thread_id, status, metadata, created_at, updated_at}` | 不存在 → **404** |
-| `PATCH /threads/{id}` | 合并更新 metadata(打 `latest_run_status`/`viewed`/`resolved` 等标记都走这) | body `{"metadata": {…}}`(merge,非替换) → **200** 更新后对象 | 不存在 → 404 |
-| `DELETE /threads/{id}` | 删线程 + 其 checkpoint/流(不可恢复) | → **200/204** | 不存在 → 404 |
-| `POST /threads/search` | 按 metadata 过滤 + 排序 + 分页搜线程(dashboard 列表的底层) | body `{"metadata": {…}, "limit", "offset", "sort_by", "sort_order"}` → **200** `[thread…]`(≤limit 条) | 400 参数非法(如 limit 越界);无匹配 → **200 空数组**(不是错误) |
-| `GET /threads/{id}/state` | **单快照读**:取最新 checkpoint 的完整 state——前端主 transcript 的唯一来源 | → **200** ThreadState:`{"values": {messages, …通道}, "next": […], "configurable": {thread_id, checkpoint_id, checkpoint_ns}, "metadata": {…}}` | 线程不存在 → 404;从未 run 过 → **200** 空快照(dashboard 侧再归一化为 `{"values":{},"next":[]}`) |
-| `GET /threads/{id}/history` | 有界历史:沿 checkpoint 链取最近 N 个快照(发现/跳转用,**禁止全量翻页**) | query `limit/before/after/filter` → **200** `[{checkpoint_id, parent_checkpoint_id, values, metadata, timestamp, next}, …]`(≤limit,最新在前) | 404;超大线程上遍历慢 → 调用方(有界代理)超时后自行降级,**本端点不主动 503** |
-| `POST /threads/{id}/history` | 同上 POST 形式(参数同 query) | 同上 | 同上 |
-| `GET /threads/{id}/stream` | **SSE join 线程流**:连接后从当前/`last_event_id` 处开始推该线程全部 run 事件;`stream_resumable` 的 run 可断线重放 | query `last_event_id`、`stream_mode` → **200** `text/event-stream`(帧见 §15.4.6) | 404;连接中途上游 run 结束 → 流以终止帧正常关闭(**不是失败**) |
-| `POST /threads/{id}/stream/events` | **v2 事件流**(前端 `StreamProvider` 主口;`__event_streaming_v2` 标记启用 v3 通道:tools/lifecycle/子代理命名空间) | body 同 stream 参数 → **200** SSE | 同上 |
+| `POST /threads` | ✏️ **建线程记录**(业务状态的容器;可指定 id 便于确定性命名) | body `{"thread_id"?: uuid, "metadata": {…}}` → **200** thread 对象 | 400 body 非法;id 已存在且 metadata 冲突 → 409 |
+| `GET /threads/{id}` | 📖 **取线程记录**(metadata 读取/权限判断的数据源) | → **200** `{thread_id, status, metadata, created_at, updated_at}` | 不存在 → **404** |
+| `PATCH /threads/{id}` | ✏️ **合并更新 metadata**(打 `latest_run_status`/`viewed`/`resolved` 等标记都走这;_merge 语义,非替换_) | body `{"metadata": {…}}`(merge,非替换) → **200** 更新后对象 | 不存在 → 404 |
+| `DELETE /threads/{id}` | 🗑️ **删线程** + 其 checkpoint/流(*不可恢复*) | → **200/204** | 不存在 → 404 |
+| `POST /threads/search` | 🔍 **搜线程**(按 metadata 过滤 + 排序 + 分页;dashboard 列表的底层) | body `{"metadata": {…}, "limit", "offset", "sort_by", "sort_order"}` → **200** `[thread…]`(≤limit 条) | 400 参数非法(如 limit 越界);无匹配 → **200 空数组**(*不是错误*) |
+| `GET /threads/{id}/state` | 📖 **单快照读**:取最新 checkpoint 的完整 state——前端主 transcript 的唯一来源 | → **200** ThreadState:`{"values": {messages, …通道}, "next": […], "configurable": {thread_id, checkpoint_id, checkpoint_ns}, "metadata": {…}}` | 线程不存在 → 404;从未 run 过 → **200** 空快照(dashboard 侧再归一化为 `{"values":{},"next":[]}`) |
+| `GET /threads/{id}/history` | 📜 **有界历史**:沿 checkpoint 链取最近 N 个快照(发现/跳转用,*禁止全量翻页*) | query `limit/before/after/filter` → **200** `[{checkpoint_id, parent_checkpoint_id, values, metadata, timestamp, next}, …]`(≤limit,最新在前) | 404;超大线程上遍历慢 → 调用方(有界代理)超时后自行降级,*本端点不主动 503* |
+| `POST /threads/{id}/history` | 📜 同上 POST 形式(参数同 query) | 同上 | 同上 |
+| `GET /threads/{id}/stream` | 📡 **SSE join 线程流**:连接后从当前/`last_event_id` 处开始推该线程全部 run 事件;`stream_resumable` 的 run 可断线重放 | query `last_event_id`、`stream_mode` → **200** `text/event-stream`(帧见 §15.4.6) | 404;连接中途上游 run 结束 → 流以终止帧正常关闭(*不是失败*) |
+| `POST /threads/{id}/stream/events` | 📡 **v2 事件流**(前端 `StreamProvider` 主口;`__event_streaming_v2` 标记启用 v3 通道:tools/lifecycle/子代理命名空间) | body 同 stream 参数 → **200** SSE | 同上 |
 
 **runs(触发契约,§5/§6 的落地字段)**
 
 | 端点 | 功能 | 成功 | 失败 |
 |---|---|---|---|
-| `POST /threads/{id}/runs` | **建 run(durable 触发)**——`create_durable_run` 就是打这里;run 进 inmem 队列异步执行,响应立即返回 | **200/202** `{"run_id", "thread_id", "status": "pending", …}`;`if_not_exists="create"` 时自动建线程 | 404 线程不存在且未给 `if_not_exists`;422 webhook 策略拒绝(§8.1);线程 busy 时按 `multitask_strategy` 处理(`interrupt` → 打断旧 run 并成功;`enqueue` → 排队;`reject` → **409** busy) |
-| `POST /threads/{id}/runs/stream` | 建 run 并直接返回该 run 的 SSE(建+流一步) | **200** SSE(首帧含 run 信息) | 同上;流错误 → 终止帧内带 error |
-| `POST /threads/{id}/runs/wait` | 建 run 并同步等到终态(阻塞) | **200** 终态结果 | 超时/失败在 body 报 |
-| `GET /threads/{id}/runs` | 列线程的 runs(新在前) | **200** `[run…]` | 404 |
-| `GET /threads/{id}/runs/{run_id}` | 查单个 run 状态(`status: pending/running/success/error/timeout/interrupted/cancelled`、`status`) | **200** run 对象 | 404 |
-| `DELETE /threads/{id}/runs/{run_id}` | 删 run 记录 | **200/204** | 404 |
-| `POST /threads/{id}/runs/{run_id}/cancel` | 取消运行中的 run(置 cancelled,不删 checkpoint) | **200** run 对象(status 置 cancelled);已在跑则异步终止 | 404 run 不存在/已是终态 → 409 或 400 |
-| `GET /threads/{id}/runs/{run_id}/stream` | 单 run SSE join(`last_event_id` 重放) | **200** SSE | 404;run 已结束且无重放 → 立即终止帧 |
-| `POST /threads/{id}/commands` | **SDK command 信封**(§15.4.4):`run.start`/`input.respond`/`input.inject`/`state.fork`;dashboard 发消息走这里 | **200** `{"type": "success", "run_id"?: str}` | `{"type": "error", "error": {…}}`(业务错,200 体);404 线程不存在且 method≠run.start;400 信封非法 |
-| `POST /runs/crons`、`POST/GET /runs/crons/search|count`、`GET/PATCH/DELETE /runs/crons/{cron_id}`、`POST /threads/{id}/runs/crons` | **cron 面**:`scheduler` 全部定时任务的注册/查询/改/删(表达式 cron + `assistant_id=scheduler` + `input.task`) | 建:**200** cron 对象(`{cron_id, cron, input, …}`);查:**200** 列表/对象;改/删:**200/204** | 400 非法 cron 表达式;404 不存在 |
+| `POST /threads/{id}/runs` | ⚡ **建 run(durable 触发)**——`create_durable_run` 就是打这里;run 进 inmem 队列异步执行,响应立即返回 | **200/202** `{"run_id", "thread_id", "status": "pending", …}`;`if_not_exists="create"` 时自动建线程 | 404 线程不存在且未给 `if_not_exists`;422 webhook 策略拒绝(§8.1);线程 busy 时按 `multitask_strategy` 处理(`interrupt` → 打断旧 run 并成功;`enqueue` → 排队;`reject` → **409** busy) |
+| `POST /threads/{id}/runs/stream` | ⚡ **建 run + 直连 SSE**(建+流一步) | **200** SSE(首帧含 run 信息) | 同上;流错误 → 终止帧内带 error |
+| `POST /threads/{id}/runs/wait` | ⚡ **建 run 并阻塞等终态** | **200** 终态结果 | 超时/失败在 body 报 |
+| `GET /threads/{id}/runs` | 📖 **列线程的 runs**(新在前) | **200** `[run…]` | 404 |
+| `GET /threads/{id}/runs/{run_id}` | 📖 **查单个 run 状态**(`status: pending/running/success/error/timeout/interrupted/cancelled`) | **200** run 对象 | 404 |
+| `DELETE /threads/{id}/runs/{run_id}` | 🗑️ **删 run 记录** | **200/204** | 404 |
+| `POST /threads/{id}/runs/{run_id}/cancel` | 🛑 **取消运行中的 run**(置 cancelled,不删 checkpoint) | **200** run 对象(status 置 cancelled);已在跑则异步终止 | 404 run 不存在/已是终态 → 409 或 400 |
+| `GET /threads/{id}/runs/{run_id}/stream` | 📡 **单 run SSE join**(`last_event_id` 重放) | **200** SSE | 404;run 已结束且无重放 → 立即终止帧 |
+| `POST /threads/{id}/commands` | ⚡ **SDK command 信封**(§15.4.4):`run.start`/`input.respond`/`input.inject`/`state.fork`;dashboard 发消息走这里 | **200** `{"type": "success", "run_id"?: str}` | `{"type": "error", "error": {…}}`(*业务错,200 体*);404 线程不存在且 method≠run.start;400 信封非法 |
+| `POST /runs/crons`、`POST/GET /runs/crons/search|count`、`GET/PATCH/DELETE /runs/crons/{cron_id}`、`POST /threads/{id}/runs/crons` | ⏰ **cron 面**:`scheduler` 全部定时任务的注册/查询/改/删(表达式 cron + `assistant_id=scheduler` + `input.task`) | 建:**200** cron 对象(`{cron_id, cron, input, …}`);查:**200** 列表/对象;改/删:**200/204** | 400 非法 cron 表达式;404 不存在 |
 
 **`POST /threads/{id}/runs` 的 body 契约(复刻必须逐字段一致)**:
 
@@ -341,11 +343,11 @@ resp(200/202):`{"run_id", "thread_id", "status", "created_at", …}`。
 
 | 端点 | 功能 | 成功 | 失败 |
 |---|---|---|---|
-| `PUT /store/items` | 写一条长期记忆(plan 内容、用户指令、skills、schedules、失败去重标记都落这) | body `{"namespace": [str…], "key": str, "value": {…}}` → **200** 写入的 item | 400 参数缺失(namespace 必须非空数组) |
-| `GET /store/items` | 按 (namespace, key) 精确读 | query `namespace`、`key` → **200** item;**404** = 不存在(store 语义,不是 200 null) | 404 无此项 |
-| `DELETE /store/items` | 删 item | **200/204** | 404 |
-| `POST /store/items/search` | 按 namespace 前缀 + 分页搜 | body `{"namespace"?: […], "prefix"?, "limit", "offset"}` → **200** `{items, …}` | 400 |
-| `POST /store/namespaces` | 列命名空间(调试用) | **200** 列表 | — |
+| `PUT /store/items` | ✏️ **写长期记忆**(plan 内容、用户指令、skills、schedules、失败去重标记都落这) | body `{"namespace": [str…], "key": str, "value": {…}}` → **200** 写入的 item | 400 参数缺失(namespace 必须非空数组) |
+| `GET /store/items` | 📖 **按 (namespace, key) 精确读** | query `namespace`、`key` → **200** item;**404** = 不存在(*store 语义,不是 200 null*) | 404 无此项 |
+| `DELETE /store/items` | 🗑️ **删 item** | **200/204** | 404 |
+| `POST /store/items/search` | 🔍 **按 namespace 前缀 + 分页搜** | body `{"namespace"?: […], "prefix"?, "limit", "offset"}` → **200** `{items, …}` | 400 |
+| `POST /store/namespaces` | 📖 **列命名空间**(调试用) | **200** 列表 | — |
 
 **其余协议端点**(`assistants/*`、`/mcp/`、`/a2a/*`、`/store/namespaces`、`/runs/stream|wait|batch|cancel` 无线程形态):**不用**,不消费、不管。
 
@@ -359,98 +361,98 @@ resp(200/202):`{"run_id", "thread_id", "status", "created_at", …}`。
 
 | 端点 | 功能 | 成功 | 失败定义 |
 |---|---|---|---|
-| `GET /auth/login`、`GET /auth/callback`、`POST /auth/logout`、`POST /auth/desktop/exchange`、`GET /slack/login`、`GET /slack/callback`、`GET /notion/login`、`GET /notion/callback` | **全部删除**(GitHub/Slack/Notion 登录链),替换为下一行 | — | 变体里访问这些路径 = 路由不存在,**404** |
-| `GET /auth/token-login`(新增) | 静态 token 换会话 cookie(唯一的登录入口) | query `token` 与 `OPEN_SWE_LOCAL_AUTH_TOKEN` 经 `hmac.compare_digest` 相等 → **200** `{}` + `Set-Cookie: osw_session=<HMAC 签名, 含 identity="local-user"、exp>`;未设 token 且 `OPEN_SWE_ALLOW_ANON=1` → **200** 发 `anon` 会话(启动时有显著告警) | token 缺/错 → **401** `{"detail":"invalid token"}`(不区分"缺"和"错",防探测);未设 token 且未开 anon → **503** `{"detail":"auth not configured; set OPEN_SWE_LOCAL_AUTH_TOKEN"}`(fail-closed) |
-| `POST /auth/logout` | 作废当前会话 cookie | → **200** `{}` + `Set-Cookie: osw_session=; Max-Age=0` | 无 cookie 也 **200**(幂等,不是错误) |
-| `GET /me` | 当前身份 + 用户级指令/设置的读取 | → **200** `{"sub": "local-user", "email": null, "name": "local-user", "admin": true, "instructions"?: str, "profile": {…}}` | 会话无效/过期 → **401**(前端据此跳登录) |
-| `GET/PUT/DELETE /me/instructions` | 用户级指令(注入所有线程的系统提示;跨线程共享面) | GET **200** `{"instructions": str}`(无则空串);PUT body 任意文本 **200** 回显;DELETE **200** `{}` | 401 未认证 |
-| `GET/PUT /profile` | 用户设置(模型默认、draft 偏好等本地化字段) | GET **200** profile 对象;PUT **200** 更新后对象 | 400 字段非法;401 |
+| `GET /auth/login`、`GET /auth/callback`、`POST /auth/logout`、`POST /auth/desktop/exchange`、`GET /slack/login`、`GET /slack/callback`、`GET /notion/login`、`GET /notion/callback` | 🔐 ~~全部删除~~(GitHub/Slack/Notion 登录链),替换为下一行 | — | 变体里访问这些路径 = 路由不存在,**404** |
+| `GET /auth/token-login`(新增) | 🔐 **静态 token 换会话 cookie**(*唯一的登录入口*) | query `token` 与 `OPEN_SWE_LOCAL_AUTH_TOKEN` 经 `hmac.compare_digest` 相等 → **200** `{}` + `Set-Cookie: osw_session=<HMAC 签名, 含 identity="local-user"、exp>`;未设 token 且 `OPEN_SWE_ALLOW_ANON=1` → **200** 发 `anon` 会话(启动时有显著告警) | token 缺/错 → **401** `{"detail":"invalid token"}`(*不区分"缺"和"错",防探测*);未设 token 且未开 anon → **503** `{"detail":"auth not configured; set OPEN_SWE_LOCAL_AUTH_TOKEN"}`(*fail-closed*) |
+| `POST /auth/logout` | 🔐 **作废当前会话 cookie** | → **200** `{}` + `Set-Cookie: osw_session=; Max-Age=0` | 无 cookie 也 **200**(*幂等,不是错误*) |
+| `GET /me` | 📖 **读当前身份** + 用户级指令/设置 | → **200** `{"sub": "local-user", "email": null, "name": "local-user", "admin": true, "instructions"?: str, "profile": {…}}` | 会话无效/过期 → **401**(前端据此跳登录) |
+| `GET/PUT/DELETE /me/instructions` | 📝 **用户级指令**(注入所有线程的系统提示;跨线程共享面) | GET **200** `{"instructions": str}`(无则空串);PUT body 任意文本 **200** 回显;DELETE **200** `{}` | 401 未认证 |
+| `GET/PUT /profile` | 🎛️ **用户设置**(模型默认、draft 偏好等本地化字段) | GET **200** profile 对象;PUT **200** 更新后对象 | 400 字段非法;401 |
 | `GET /my-mapping`、`GET/DELETE /admin/user-mappings*`、`GET /repos`、`GET /team-credentials*`、`GET/PUT /team-settings*`、`PUT /team-settings/transcription`、`GET/PUT/DELETE /my-credentials/*`(currents/langsmith/notion) | ✂️ 删(多用户映射/团队凭据/第三方集成) | — | 404(路由不存在) |
 
 **B. 线程核心(留,变体主战场)**
 
 | 端点 | 功能 | 成功 | 失败定义 |
 |---|---|---|---|
-| `GET /threads` | **线程列表**(Agents 首页/侧栏数据源):过滤+排序+分页封装运行时 `POST /threads/search`(加 `metadata.local_user` 过滤,单用户下恒真) | query `limit(≤100,默认25)/offset/resolved?/viewed?/source?/status?/query?(模糊)/scope=all\|interactive\|automation/automation_id?/sort_by=updated_at\|created_at` → **200** `{"items": [ThreadListItem], "limit", "offset", "hasMore": bool}`;无结果 = 200 空 items | 401 未认证;400 参数非法(如 `limit>100`、`scope` 非枚举) |
-| `GET /threads/page`、`GET /threads/sidebar` | 列表变体(分页页 / 侧栏精简字段,同一底层) | 同 `GET /threads`(字段子集) | 同上 |
-| `GET /threads/{id}` | **线程详情元数据**(status/owner/links;**transcript 不在这**——前端另调 `/state` hydrate) | → **200** ThreadListItem 全字段 + `{"isOwner": true, "status", "latest_run_id"?, "links": {"web", "plan"?, "trace"?}}` | **404 归一化**:线程不存在**或**非本用户 → 一律 404(不泄漏存在性;变体单用户下 owner 判据恒真);另:从未 run 的线程,详情里 `status="idle"` |
-| `ThreadListItem` 字段(定义) | 列表/详情元素结构 | `id, title, repo, repoFullName, branch, model, effort, planMode, planStatus, adminThread, source, origin, threadCategory, triggerKind, automationId?, automationName?, status(idle\|running\|error\|interrupted), viewed, viewedAt, createdAt, updatedAt, lastUserMessage?` | — |
-| `DELETE /threads/{id}` | 删线程 + 其 checkpoint/流(不可恢复) | **200/204** `{}` | 404(归一化同上);线程 busy(有 running run)→ 先取消再删,或 **409** `{"detail":"thread busy"}` |
-| `POST /threads/{id}/resolve` | 标记线程已解决/未解决(列表分组) | body `{"resolved": bool}` → **200** 更新后的列表项 | 404 |
-| `POST /threads/{id}/cancel` | 取消线程**当前** run | → **200** `{"cancelled": bool}`;`cancelled=false` 且 200 = 无活动 run(幂等成功,不是错误) | 404 线程不存在 |
-| `POST /threads/{id}/runs/{run_id}/cancel` | 取消指定 run | 同上 | 404 run 不存在;run 已终态 → 400/409 |
-| `POST /threads/{id}/messages` | **发消息 = 触发 run**(用户主动交互入口) | body(`ThreadMessageBody`):`{"content": str(≤20000), "images": [{data(base64), media_type, filename?}], "model_id"?, "effort"?, "plan_mode": bool}` → 构造 `build_run_input` 信封(source=`web`)→ `dispatch_agent_run` → **200** `{"run_id", "thread_id", "queued": bool}`;线程不存在时 `if_not_exists="create"` 自动建 | 400 `content` 超 20000 或空;401 未认证;运行时 409(busy 且策略 reject)透传;运行时不可达 → **502** `{"detail":"runtime unreachable"}` |
-| `POST /threads/{id}/commands` | **SDK command 信封透传 + 富化**(§15.4.4):前端 `StreamProvider` 的主发送口;`run.start` 时服务端注入 `configurable`(`local_user`/`repo`/`plan_mode`/`prepare_run_id`/模型覆盖)+ `metadata.source="dashboard"`,再 POST 到运行时同名端点 | raw JSON body → 运行时返回 `{"type":"success","run_id"?}` 时 → **200** 原样透传;`{"type":"error",…}` 时 → **200 + 同体透传**(业务错在体里,HTTP 仍 200,前端按 type 判) | **404 归一化**:线程不存在且 `method≠run.start` → 404;非 JSON body → **415**;运行时不可达 → 502;线程 busy 且方法为 `input.*` → 409 透传 |
-| `POST /threads/{id}/history` | **有界历史代理**(防超大线程冻结单循环的第一道闸) | raw body(`{"limit"?, "before"?, …}`)→ 无过滤请求 `limit` 强制 clamp ≤5 → 90s 预算 → **200** 透传运行时 history 数组(≤limit 条,最新在前) | 上游超时 → **503** `{"detail": "thread history request timed out; retry"}`(退避链:`{limit:1}` 重试 3 次×1.5s → 仍败则降级 `/state` 单快照包装成 1 条;30s 快照缓存去重);404/415 同上 |
-| `GET /threads/{id}/state` | **有界 state 代理**(主 transcript 读取入口) | 15s 预算单快照 → **200** 透传 ThreadState;**归一化**:线程存在但从未 run → `{"values": {}, "next": []}`(200,不是 404——前端据此显示空对话) | 线程不存在 → 404;15s 预算耗尽 → **503**(同上);上游 5xx → 502 |
-| `GET /threads/{id}/stream` | **SSE 透传**:join 线程流(上游 `GET /threads/{id}/stream`,带 `last_event_id`),权限校验后字节流原样回传 | **200** `text/event-stream`;run 结束 → 流正常关闭 | 404/401 先于流校验;运行中上游断开 → 流带错误终止帧;**客户端断开必须释放上游订阅**(流订阅回收,否则泄漏事件循环) |
-| `POST /threads/{id}/stream/events` | **SSE 透传 v2 事件流**(前端 `StreamProvider` 主口;晚连接可见历史事件——`stream_resumable` 的价值) | 同上 | 同上 |
+| `GET /threads` | 📖 **线程列表**(Agents 首页/侧栏数据源):过滤+排序+分页封装运行时 `POST /threads/search`(加 `metadata.local_user` 过滤,单用户下恒真) | query `limit(≤100,默认25)/offset/resolved?/viewed?/source?/status?/query?(模糊)/scope=all\|interactive\|automation/automation_id?/sort_by=updated_at\|created_at` → **200** `{"items": [ThreadListItem], "limit", "offset", "hasMore": bool}`;无结果 = 200 空 items | 401 未认证;400 参数非法(如 `limit>100`、`scope` 非枚举) |
+| `GET /threads/page`、`GET /threads/sidebar` | 📖 列表变体(分页页 / 侧栏精简字段,同一底层) | 同 `GET /threads`(字段子集) | 同上 |
+| `GET /threads/{id}` | 📖 **线程详情元数据**(status/owner/links;*transcript 不在这*——前端另调 `/state` hydrate) | → **200** ThreadListItem 全字段 + `{"isOwner": true, "status", "latest_run_id"?, "links": {"web", "plan"?, "trace"?}}` | **404 归一化**:线程不存在**或**非本用户 → 一律 404(不泄漏存在性;变体单用户下 owner 判据恒真);另:从未 run 的线程,详情里 `status="idle"` |
+| `ThreadListItem` 字段(定义) | 📐 **列表/详情元素结构** | `id, title, repo, repoFullName, branch, model, effort, planMode, planStatus, adminThread, source, origin, threadCategory, triggerKind, automationId?, automationName?, status(idle\|running\|error\|interrupted), viewed, viewedAt, createdAt, updatedAt, lastUserMessage?` | — |
+| `DELETE /threads/{id}` | 🗑️ **删线程** + 其 checkpoint/流(*不可恢复*) | **200/204** `{}` | 404(归一化同上);线程 busy(有 running run)→ 先取消再删,或 **409** `{"detail":"thread busy"}` |
+| `POST /threads/{id}/resolve` | ✅ **标记线程已解决/未解决**(列表分组) | body `{"resolved": bool}` → **200** 更新后的列表项 | 404 |
+| `POST /threads/{id}/cancel` | 🛑 **取消线程当前 run** | → **200** `{"cancelled": bool}`;`cancelled=false` 且 200 = 无活动 run(*幂等成功,不是错误*) | 404 线程不存在 |
+| `POST /threads/{id}/runs/{run_id}/cancel` | 🛑 取消指定 run | 同上 | 404 run 不存在;run 已终态 → 400/409 |
+| `POST /threads/{id}/messages` | ⚡ **发消息 = 触发 run**(用户主动交互入口) | body(`ThreadMessageBody`):`{"content": str(≤20000), "images": [{data(base64), media_type, filename?}], "model_id"?, "effort"?, "plan_mode": bool}` → 构造 `build_run_input` 信封(source=`web`)→ `dispatch_agent_run` → **200** `{"run_id", "thread_id", "queued": bool}`;线程不存在时 `if_not_exists="create"` 自动建 | 400 `content` 超 20000 或空;401 未认证;运行时 409(busy 且策略 reject)透传;运行时不可达 → **502** `{"detail":"runtime unreachable"}` |
+| `POST /threads/{id}/commands` | ⚡ **SDK command 信封透传 + 富化**(§15.4.4):前端 `StreamProvider` 的主发送口;`run.start` 时服务端注入 `configurable`(`local_user`/`repo`/`plan_mode`/`prepare_run_id`/模型覆盖)+ `metadata.source="dashboard"`,再 POST 到运行时同名端点 | raw JSON body → 运行时返回 `{"type":"success","run_id"?}` 时 → **200** 原样透传;`{"type":"error",…}` 时 → **200 + 同体透传**(*业务错在体里,HTTP 仍 200,前端按 type 判*) | **404 归一化**:线程不存在且 `method≠run.start` → 404;非 JSON body → **415**;运行时不可达 → 502;线程 busy 且方法为 `input.*` → 409 透传 |
+| `POST /threads/{id}/history` | 🔁 **有界历史代理**(防超大线程冻结单循环的第一道闸) | raw body(`{"limit"?, "before"?, …}`)→ 无过滤请求 `limit` 强制 clamp ≤5 → 90s 预算 → **200** 透传运行时 history 数组(≤limit 条,最新在前) | 上游超时 → **503** `{"detail": "thread history request timed out; retry"}`(退避链:`{limit:1}` 重试 3 次×1.5s → 仍败则降级 `/state` 单快照包装成 1 条;30s 快照缓存去重);404/415 同上 |
+| `GET /threads/{id}/state` | 🔁 **有界 state 代理**(主 transcript 读取入口) | 15s 预算单快照 → **200** 透传 ThreadState;**归一化**:线程存在但从未 run → `{"values": {}, "next": []}`(*200,不是 404*——前端据此显示空对话) | 线程不存在 → 404;15s 预算耗尽 → **503**(同上);上游 5xx → 502 |
+| `GET /threads/{id}/stream` | 📡 **SSE 透传**:join 线程流(上游 `GET /threads/{id}/stream`,带 `last_event_id`),权限校验后字节流原样回传 | **200** `text/event-stream`;run 结束 → 流正常关闭 | 404/401 先于流校验;运行中上游断开 → 流带错误终止帧;**客户端断开必须释放上游订阅**(流订阅回收,否则泄漏事件循环) |
+| `POST /threads/{id}/stream/events` | 📡 **SSE 透传 v2 事件流**(前端 `StreamProvider` 主口;晚连接可见历史事件——`stream_resumable` 的价值) | 同上 | 同上 |
 
 **C. Plan(留,7 端点)** — 存储:store 命名空间 `plans`
 
 | 端点 | 功能 | 成功 | 失败定义 |
 |---|---|---|---|
-| `GET /plan/{thread_id}` | 读当前 plan(内容+状态+审批人) | **200** `{"content", "content_format", "status": "draft\|pending\|approved\|rejected", "author_login", "comments": […]}` | **404** 该线程无 plan(前端据此不显示 plan 面板) |
-| `PUT /plan/{thread_id}` | 保存/更新 plan(进入待审批) | body `{"content", "content_format": "html"\|"markdown"}` → **200** 更新后对象 | 400 content 空或 `content_format` 非法;线程不存在 → 404 |
-| `POST /plan/{thread_id}/approve` | 审批通过(状态翻转) | **200** 更新后对象;`status="approved"`;审批动作由**前端**随后发 `run.start`(带 `plan_mode=false`)——**服务端不自动跑** | 404 无 plan;已终态再审批 → **409** `{"detail":"plan already approved/rejected"}` |
-| `POST /plan/{thread_id}/reject` | 审批拒绝 | **200** `status="rejected"` | 404;409 同上 |
-| `GET /plan/{thread_id}/comments` | 列 plan 评论 | **200** `[{"comment_id", "author_login", "content", "created_at"}]` | 404 无 plan |
-| `POST /plan/{thread_id}/comments` | 加评论 | body `{"content"}` → **200** 新评论对象 | 404;400 空内容 |
-| `DELETE /plan/{thread_id}/comments/{comment_id}` | 删评论(仅作者或 admin) | **200/204** | 404 不存在;非作者 → **403** |
+| `GET /plan/{thread_id}` | 📝 **读当前 plan**(内容+状态+审批人) | **200** `{"content", "content_format", "status": "draft\|pending\|approved\|rejected", "author_login", "comments": […]}` | **404** 该线程无 plan(前端据此不显示 plan 面板) |
+| `PUT /plan/{thread_id}` | 📝 **保存/更新 plan**(进入待审批) | body `{"content", "content_format": "html"\|"markdown"}` → **200** 更新后对象 | 400 content 空或 `content_format` 非法;线程不存在 → 404 |
+| `POST /plan/{thread_id}/approve` | ✅ **审批通过**(状态翻转);*审批动作由前端随后发 `run.start`(`plan_mode=false`)——服务端不自动跑* | **200** 更新后对象;`status="approved"` | 404 无 plan;已终态再审批 → **409** `{"detail":"plan already approved/rejected"}` |
+| `POST /plan/{thread_id}/reject` | ❌ **审批拒绝** | **200** `status="rejected"` | 404;409 同上 |
+| `GET /plan/{thread_id}/comments` | 📖 **列 plan 评论** | **200** `[{"comment_id", "author_login", "content", "created_at"}]` | 404 无 plan |
+| `POST /plan/{thread_id}/comments` | 📝 **加评论** | body `{"content"}` → **200** 新评论对象 | 404;400 空内容 |
+| `DELETE /plan/{thread_id}/comments/{comment_id}` | 🗑️ **删评论**(仅作者或 admin) | **200/204** | 404 不存在;非作者 → **403** |
 
 **D. Workflow 审批(留,3 端点)** — 存储:thread metadata `workflow_approvals`
 
 | 端点 | 功能 | 成功 | 失败定义 |
 |---|---|---|---|
-| `GET /workflow-approval/{thread_id}` | 列该线程待决/历史审批(push 守卫命中时挂起) | **200** `{"approvals": [{"fingerprint", "message", "status": "pending\|approved\|rejected", "created_at"}]}`;无 → 200 空数组 | 404 线程不存在 |
-| `POST /workflow-approval/{thread_id}/{fingerprint}/approve` | 批准该指纹的推送 | **200** 更新后审批对象(status=approved) | 404 线程/指纹不存在;已决 → **409** |
-| `POST /workflow-approval/{thread_id}/{fingerprint}/reject` | 拒绝 | **200** status=rejected | 同上 |
+| `GET /workflow-approval/{thread_id}` | 🚦 **列该线程待决/历史审批**(push 守卫命中时挂起) | **200** `{"approvals": [{"fingerprint", "message", "status": "pending\|approved\|rejected", "created_at"}]}`;无 → 200 空数组 | 404 线程不存在 |
+| `POST /workflow-approval/{thread_id}/{fingerprint}/approve` | ✅ **批准该指纹的推送** | **200** 更新后审批对象(status=approved) | 404 线程/指纹不存在;已决 → **409** |
+| `POST /workflow-approval/{thread_id}/{fingerprint}/reject` | ❌ **拒绝该指纹的推送** | **200** status=rejected | 同上 |
 
 **E. Automations/schedules(留,5 端点)** — 落地:每个 schedule = 运行时一条 cron(`POST /runs/crons`,`assistant_id=scheduler`)
 
 | 端点 | 功能 | 成功 | 失败定义 |
 |---|---|---|---|
-| `GET /schedules` | 列定时任务 | query `limit/offset` → **200** `[{"id","name","cron","prompt","enabled","next_fire_at","last_result"?}]` | 401 |
-| `POST /schedules` | 新建定时任务(到点由 scheduler 扇出 `launch_scheduled_agent_run`) | body `{"name","cron","prompt","enabled"}` → **200** 新建对象(含生成的 `id` 与 `next_fire_at`) | **400** 非法 cron 表达式(透传运行时错误);401 |
-| `PATCH /schedules/{id}` | 改名/改 cron/启停 | body 部分字段 → **200** 更新后对象 | 404;400 非法 cron |
-| `DELETE /schedules/{id}` | 删定时任务(连带删运行时 cron) | **200/204** | 404 |
-| `POST /schedules/{id}/trigger` | 立即触发一次(不等下个 tick) | **200** `{"triggered": true, "run_id"?}`;触发即入队,异步执行 | 404;运行时不可达 → 502 |
+| `GET /schedules` | ⏰ **列定时任务** | query `limit/offset` → **200** `[{"id","name","cron","prompt","enabled","next_fire_at","last_result"?}]` | 401 |
+| `POST /schedules` | ⏰ **新建定时任务**(到点由 scheduler 扇出 `launch_scheduled_agent_run`) | body `{"name","cron","prompt","enabled"}` → **200** 新建对象(含生成的 `id` 与 `next_fire_at`) | **400** 非法 cron 表达式(透传运行时错误);401 |
+| `PATCH /schedules/{id}` | ⏰ **改名/改 cron/启停** | body 部分字段 → **200** 更新后对象 | 404;400 非法 cron |
+| `DELETE /schedules/{id}` | 🗑️ **删定时任务**(连带删运行时 cron) | **200/204** | 404 |
+| `POST /schedules/{id}/trigger` | ⏰ **立即触发一次**(不等下个 tick) | **200** `{"triggered": true, "run_id"?}`;触发即入队,异步执行 | 404;运行时不可达 → 502 |
 
 **F. Skills / repo instructions(留,8 端点)** — 存储:store(`skills`/`org_skills` 命名空间;repo instructions 按 `owner/name` 键)
 
 | 端点 | 功能 | 成功 | 失败定义 |
 |---|---|---|---|
-| `GET /skills` | 列用户技能 | **200** `[{"name","description","updated_at"}]` | 401 |
-| `POST /skills` | 建技能(body `{"name","description","instructions"?}`;name 小写字母/数字/单连字符) | **200** 新建对象 | **400** name 非法;已存在 → **409** |
-| `PUT /skills/{name}` | 改技能 | **200** 更新后 | 404 不存在 |
-| `DELETE /skills/{name}` | 删技能 | **200/204** | 404 |
-| `GET/POST /organization-skills`、`PUT/DELETE /organization-skills/{name}` | 组织技能(本地单用户可并入用户技能,保留双命名空间则同上行契约) | 同 skills 各行 | 同上 |
-| `GET /agent-instructions` | 列 per-repo 指令(注入系统提示的 repo instructions) | **200** `[{"full_name","content","updated_at"}]` | 401 |
-| `POST /agent-instructions` | 建 per-repo 指令(body `{"full_name":"owner/name","content"}`) | **200** 新建 | 400 full_name 非 `owner/name` 格式 |
-| `GET/PUT/DELETE /agent-instructions/{full_name}` | 读/改/删单条 | GET/PUT **200** 对象;DELETE **200/204** | 404 |
+| `GET /skills` | 🧩 **列用户技能** | **200** `[{"name","description","updated_at"}]` | 401 |
+| `POST /skills` | 🧩 **建技能**(body `{"name","description","instructions"?}`;name 小写字母/数字/单连字符) | **200** 新建对象 | **400** name 非法;已存在 → **409** |
+| `PUT /skills/{name}` | 🧩 **改技能** | **200** 更新后 | 404 不存在 |
+| `DELETE /skills/{name}` | 🗑️ **删技能** | **200/204** | 404 |
+| `GET/POST /organization-skills`、`PUT/DELETE /organization-skills/{name}` | 🧩 **组织技能**(本地单用户可并入用户技能,保留双命名空间则同上行契约) | 同 skills 各行 | 同上 |
+| `GET /agent-instructions` | 🧩 **列 per-repo 指令**(注入系统提示的 repo instructions) | **200** `[{"full_name","content","updated_at"}]` | 401 |
+| `POST /agent-instructions` | 🧩 **建 per-repo 指令**(body `{"full_name":"owner/name","content"}`) | **200** 新建 | 400 full_name 非 `owner/name` 格式 |
+| `GET/PUT/DELETE /agent-instructions/{full_name}` | 🧩 **读/改/删单条 per-repo 指令** | GET/PUT **200** 对象;DELETE **200/204** | 404 |
 
 **G. 模型选项(留,1 端点)**
 
 | 端点 | 功能 | 成功 | 失败定义 |
 |---|---|---|---|
-| `GET /options` | 前端下拉的模型/effort 列表 | **200** `{"models": [{"id","label","effort_options": [str]}]}`(来自 `SUPPORTED_MODEL_IDS`,按已配置 provider 过滤) | 401;无可用模型 → 200 空数组(前端显示"未配置模型") |
+| `GET /options` | 🎛️ **前端下拉的模型/effort 列表** | **200** `{"models": [{"id","label","effort_options": [str]}]}`(来自 `SUPPORTED_MODEL_IDS`,按已配置 provider 过滤) | 401;无可用模型 → 200 空数组(前端显示"未配置模型") |
 
 **H. Health/debug(留,4 端点)**
 
 | 端点 | 功能 | 成功 | 失败定义 |
 |---|---|---|---|
-| `GET /health` | 存活探测(k8s/编排用) | **200** `{"status":"healthy"}`(仅进程活着即 200;**不**探测 Postgres/运行时) | 进程不可达(连接拒绝) |
-| `GET /ok` | 同上的裸探活 | **200** `ok` | 同上 |
-| `GET /debug/queue-probe` | 事件循环 lag 探针快照(§12 验收"不冻结 >1s"的观测口) | **200** `{"lag_ms": float, "loop_thread": str, "samples": […]}`;`OPEN_SWE_QUEUE_DEBUG` 未开 → 200 空样本 | 401 未认证 |
-| `POST /debug/queue-probe` | 触发一次即时探针 | **200** 同 GET | 401 |
+| `GET /health` | 🩺 **存活探测**(k8s/编排用) | **200** `{"status":"healthy"}`(仅进程活着即 200;**不**探测 Postgres/运行时) | 进程不可达(连接拒绝) |
+| `GET /ok` | 🩺 同上的裸探活 | **200** `ok` | 同上 |
+| `GET /debug/queue-probe` | 🩺 **事件循环 lag 探针快照**(§12 验收"不冻结 >1s"的观测口) | **200** `{"lag_ms": float, "loop_thread": str, "samples": […]}`;`OPEN_SWE_QUEUE_DEBUG` 未开 → 200 空样本 | 401 未认证 |
+| `POST /debug/queue-probe` | 🩺 **触发一次即时探针** | **200** 同 GET | 401 |
 
 **I. 可选留(本地 git 相关,默认不做,需要时加回)**
 
 | 端点 | 功能 | 成功 | 失败定义 |
 |---|---|---|---|
-| `GET /threads/{id}/working-tree-diff` | 沙箱内 `git diff` 物化,供前端 diff 面板(纯本地能力) | **200** `{"diff": str, "branch": str}` | 404 线程/沙箱不存在;沙箱无 git 仓 → **200** 空 diff |
-| `GET /threads/{id}/branch-diff` | 分支 vs base 的 diff | **200** 同上 | 同上 |
-| `GET /threads/{id}/terminal/connect` | ✂️ 删(桌面终端,WebSocket) | — | 404 |
+| `GET /threads/{id}/working-tree-diff` | 🌿 **沙箱内 `git diff` 物化**,供前端 diff 面板(*纯本地能力,不依赖 GitHub*) | **200** `{"diff": str, "branch": str}` | 404 线程/沙箱不存在;沙箱无 git 仓 → **200** 空 diff |
+| `GET /threads/{id}/branch-diff` | 🌿 **分支 vs base 的 diff** | **200** 同上 | 同上 |
+| `GET /threads/{id}/terminal/connect` | 🖥️ ✂️ 删(桌面终端,WebSocket) | — | 404 |
 
 **J. 删除清单(✂️,共 60 端点)**
 
@@ -460,8 +462,8 @@ resp(200/202):`{"run_id", "thread_id", "status", "created_at", …}`。
 
 | 端点 | 方向 | 功能 | 成功(2xx) | 失败定义 |
 |---|---|---|---|---|
-| `POST /webhooks/run-complete?token=…` | 运行时 →(loopback 或真实网络)→ 本服务 | **留,唯一保留的 webhook**:run 终结(成功/失败/超时)的统一收尾信号——保证"任何 run 都以一个确定信号结束,即使 agent 崩溃" | token 与 `RUN_COMPLETE_WEBHOOK_SECRET` 经 `hmac.compare_digest` 相等 + body 为合法 JSON → **200**:按 `run_id` 幂等处理(`handle_run_completion`):`status=success` → 记日志;`error/timeout/interrupted` → 取 `thread_id` metadata,落 `failure_ack_run_ids` + `latest_run_status` 标记;resp `{"status": "handled"}`(首次)或 `{"status": "deduped", "run_id"}`(重复回调,幂等) | **503** `RUN_COMPLETE_WEBHOOK_SECRET` 未设(fail-closed,路由整体拒收);**401** token 缺失/错(不区分);body 非 JSON → **200** `{"status":"error","message":"Invalid JSON"}`(不 5xx——webhook 失败不应触发运行时重试风暴);`thread_id` 已不存在 → **200** `{"status":"ignored","reason":"thread gone"}` |
-| `POST /webhooks/github`、`GET/POST /webhooks/slack`、`POST /webhooks/slack/interactivity`、`GET/POST /webhooks/linear` | 外部平台 → 本服务 | ✂️ **全删**(§0/§5;无 GitHub/Slack/Linear 触发源) | — | 变体里访问 = 路由不存在 → **404** |
+| `POST /webhooks/run-complete?token=…` | 运行时 →(loopback 或真实网络)→ 本服务 | 🔔 **留,唯一保留的 webhook**:run 终结(成功/失败/超时)的统一收尾信号——*保证"任何 run 都以一个确定信号结束,即使 agent 崩溃"* | token 与 `RUN_COMPLETE_WEBHOOK_SECRET` 经 `hmac.compare_digest` 相等 + body 为合法 JSON → **200**:按 `run_id` 幂等处理(`handle_run_completion`):`status=success` → 记日志;`error/timeout/interrupted` → 取 `thread_id` metadata,落 `failure_ack_run_ids` + `latest_run_status` 标记;resp `{"status": "handled"}`(首次)或 `{"status": "deduped", "run_id"}`(重复回调,幂等) | **503** `RUN_COMPLETE_WEBHOOK_SECRET` 未设(fail-closed,路由整体拒收);**401** token 缺失/错(不区分);body 非 JSON → **200** `{"status":"error","message":"Invalid JSON"}`(不 5xx——webhook 失败不应触发运行时重试风暴);`thread_id` 已不存在 → **200** `{"status":"ignored","reason":"thread gone"}` |
+| `POST /webhooks/github`、`GET/POST /webhooks/slack`、`POST /webhooks/slack/interactivity`、`GET/POST /webhooks/linear` | 外部平台 → 本服务 | 🚫 ✂️ **全删**(§0/§5;无 GitHub/Slack/Linear 触发源) | — | 变体里访问 = 路由不存在 → **404** |
 
 ### 15.4 HTTP 协议字段盘点
 
@@ -570,5 +572,8 @@ resp(200/202):`{"run_id", "thread_id", "status", "created_at", …}`。
   - 认证/权限失败 → 建流**前**返回 **401/404**(普通 JSON,不进流);
   - 流运行中上游 run 崩溃 → 流内发 `error`/终止帧后关闭(客户端据帧内 `error` 字段判,**HTTP 层仍 200**);
   - 代理侧(dashboard 透传)上游不可达 → **502**(建流前);
+  - **客户端断开**:服务端必须释放上游订阅(流订阅回收),否则泄漏事件循环——这是"成功/失败"之外的**资源不变式**,§12 验收项。
+- **验收口径**:用 `langgraph-sdk 0.4.2` 的 `client.runs.stream` 与前端 `StreamProvider` 双端消费通过,不逐帧比对 schema。
+ - 代理侧(dashboard 透传)上游不可达 → **502**(建流前);
   - **客户端断开**:服务端必须释放上游订阅(流订阅回收),否则泄漏事件循环——这是"成功/失败"之外的**资源不变式**,§12 验收项。
 - **验收口径**:用 `langgraph-sdk 0.4.2` 的 `client.runs.stream` 与前端 `StreamProvider` 双端消费通过,不逐帧比对 schema。
