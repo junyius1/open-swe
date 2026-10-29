@@ -2,6 +2,7 @@
 
 > **目标读者**:AI 编码代理 / 熟悉 LangGraph + FastAPI 的工程师。本文是**自包含**的实现契约:照它就能从零复刻一个「dashboard 服务器」,交付物是**只在本地 git 分支上 commit**的自托管编程 agent 服务器。
 > **裁剪范围**:拿掉 **GitHub 登录**、**GitHub 授权(凭据面)**、**提交 PR** 三块。交付收敛为 **本地 git 分支 commit**(push 可选,纯宿主凭据;服务器**不持有任何 GitHub token**)。
+> **多用户**:**:2024 运行时与 :8001 dashboard 服务器都必须支持多个人同时登录**——每个用户各自持有会话、各自看到/操作自己的线程与 commit 身份。认证仍是**本地静态 token 面**(不用 GitHub),但**不是"一个 token 一个身份"**:用「共享服务端 token 换 per-user 会话 cookie」+ 可选「本地用户注册表」实现多身份(§3)。两个服务器(同进程/双进程两种部署)都走**同一套**认证与权限代码(§18)。
 > **依据**:仓库真实代码(所有模块路径、函数名、env、常量、状态码均可逐条验证) + `docs/OPEN_SWE_SERVER_2024_DESIGN.md`(下称 **2024 设计书**)的架构骨架。未在此重复的 2024 概念(单事件循环铁律、DeltaChannel messages、checkpoint 三表)以 2024 设计书为准,本文在需要处**逐字给出数值与行为**。
 > **日期**:2026-10-28
 
@@ -33,7 +34,7 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 
 | 域 | 2024 版 | 本变体 | 落点 |
 |---|---|---|---|
-| 身份/登录 | GitHub OAuth(`oauth.py`)+ PKCE + org 门 | **单一静态 token**(或显式开放本地) | `agent/local_auth.py`、`agent/dashboard/auth.py`(新增)、`routes.py` |
+| 身份/登录 | GitHub OAuth(`oauth.py`)+ PKCE + org 门 | **多用户本地 token 认证**:共享服务端 token 换 per-user 会话(可选本地用户注册表);**不用 GitHub** | `agent/local_auth.py`、`agent/dashboard/auth.py`(新增)、`agent/dashboard/user_registry.py`(新增)、`routes.py` |
 | 注册图 | 5 个:agent/reviewer/analyzer/chat/scheduler | **2 个:agent + scheduler** | `langgraph.json`、`agent/graphs/*` |
 | 沙箱鉴权 | 每沙箱注入 GitHub App token 作 `gh` 代理 | **无任何 GitHub token**;`SANDBOX_TYPE=local`,git 走宿主 `~/.gitconfig` | `agent/server.py`、`agent/utils/sandbox.py` |
 | 提交交付 | `open_pull_request` 工具 + PR 守卫中间件 + PR 提示段 | **仅本地分支 commit**;push 可选;`LOCAL_COMMIT_SECTION` 提示 | `agent/prompt.py`、工具列表 |
@@ -89,33 +90,55 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 
 ---
 
-## 3. 身份与登录(替换 GitHub OAuth)
+## 3. 身份与登录(替换 GitHub OAuth,多用户)
 
-**目标**:dashboard 会话认证不再依赖 GitHub,用一个最小、可本地验证的认证面。**单用户语义**——本地部署只有一个操作者。
+**目标**:dashboard 会话认证不再依赖 GitHub,用一个最小、可本地验证的认证面;同时 **:2024 运行时与 :8001 dashboard 服务器都支持多个用户同时登录**——每个用户独立的会话、独立的线程归属、独立的 commit 作者身份。
 
-### 3.1 认证方式(二选一,默认 A)
+### 3.1 多用户模型(核心设计)
 
-**A. 静态 token(推荐,零外部依赖)**
-- 服务端持有 env `OPEN_SWE_LOCAL_AUTH_TOKEN`(secret)。
-- **dashboard 面**(`:2024/dashboard/api/*`):前端/SDK 用 `Authorization: Bearer <token>` 或登录后拿会话 cookie;服务端用 `hmac.compare_digest` 比对(防时序),身份固定为 **`local-user`**。
-  - **复活并复用现成的 `agent/local_auth.py`**——它已是这个语义:`langgraph_sdk.Auth` + `@auth.authenticate` + `OPEN_SWE_LOCAL_AUTH_TOKEN` + 返回 `{"identity": "local-user"}`。在 app 里把它接到 LangGraph 协议面的 auth 钩子。
-  - dashboard 侧用同一个 env 做会话依赖 `_SESSION_DEP` 的替代(§5.1)。
-- **协议面**(LangGraph 非 `/dashboard/api` 路由):`Authorization: Bearer <token>` → `hmac.compare_digest` 相等则放行,注入 `langgraph_auth_user={"identity":"local-user"}`;scheme 非 bearer / token 缺 / 错 → **401** `{"detail":"Invalid bearer token"}`。
+认证凭据是**一个共享的服务端 token**(`OPEN_SWE_LOCAL_AUTH_TOKEN`,证明"能访问本机"),**身份由登录时的 `username` 决定**,会话按用户隔离:
 
-**B. 开放本地模式**
-- 当 `OPEN_SWE_LOCAL_AUTH_TOKEN` **未设**且 `OPEN_SWE_ALLOW_ANON=1` 时放行,身份 = **`anon`**。**仅用于裸开发**,启动时打印显著告警;默认必须设 token。
+1. **登录**:`POST /auth/login {username, token}`。
+   - `token` 与 `OPEN_SWE_LOCAL_AUTH_TOKEN` 经 `hmac.compare_digest` 比对(防时序),不等 → **401**(不区分"缺"和"错",防探测)。
+   - `username` 是**自由字符串**(1–64 字符,`[A-Za-z0-9._-]+`)。若启用了本地用户注册表(§3.1.1)则 username 必须已存在;否则任意新用户名**自动创建**(首次登录即注册)。
+   - 成功 → **200** `{sub, name, is_admin}` + `Set-Cookie: osw_session=<按用户签名的会话值, sub=username、exp>`。
+2. **会话**:cookie 值**按用户签名**(含 `sub`)——两个浏览器各拿各的 cookie,服务端互不串号。`_SESSION_DEP` 解出 `{sub, name, is_admin, email:null}`。
+3. **归属与隔离**(§3.4):thread metadata 的 `local_user` = 会话 `sub`;列表只返回本人线程;commit 作者 = 该用户的 git 身份(§3.5)。**多人可同时在线、同时开 run**——run 本身无用户互斥(一个线程同时只允许一个活跃 run 的 busy 语义保留,但不同线程完全并行;同一线程的多人操作按 §5.2 的 owner 判定)。
+4. **admin**:`CONFIGURED_ADMINS` env(逗号分隔的 username 列表)内的用户 `is_admin=true`(可看 `all=true` 的全量列表、`admin/*` 端点);其余用户 `is_admin=false`。本地部署通常把第一个登录的人写进 `CONFIGURED_ADMINS`。
+
+**两种部署、同一套认证**(详见 §18):
+- **同进程**(`langgraph dev` 挂了 `http.app`):dashboard 面用会话 cookie;协议面(LangGraph REST/SSE)用 `Authorization: Bearer`——bearer 形态见 §3.1.2。
+- **双进程**(运行时 `:2024` + dashboard uvicorn `:8001`):dashboard 进程用会话 cookie 面向浏览器,内部调运行时用**进程间 bearer**(§3.1.2);浏览器**不直接**访问 `:2024` 的协议面(所有读都经 `:8001` 的代理端点,§5.2)。
+
+### 3.1.1 可选:本地用户注册表
+
+- 存储:store 命名空间 `local_users`,key=username,value `{"username","created_at","admin":bool,"git_name"?,"git_email"?}`。**多进程部署下两个服务器共享同一 store(同一 Postgres)** → 用户表天然跨进程一致。
+- `OPEN_SWE_USER_REGISTRY=1`(默认开):登录要求 username 已存在(否则 401 `{"detail":"unknown user"}`),另提供 `POST /auth/register {username, token}` 由 admin 或首个用户创建账号(`token` 同样要过共享 token 校验)。
+- `OPEN_SWE_USER_REGISTRY=0`(裸开发):任意 username 首登自动建条目。
+- 注册表里可存**每用户 git 身份**(`git_name`/`git_email`),用于 §3.5 的 commit 作者;未存则回退宿主默认。
+
+### 3.1.2 协议面 bearer(多用户版 `agent/local_auth.py`)
+
+现网 `agent/local_auth.py` 是"单 token → 固定 `local-user`"。改为**复合 bearer 支持多身份**:
+
+- **形态 A(内部服务间,默认)**:`Authorization: Bearer <OPEN_SWE_LOCAL_AUTH_TOKEN>` → 校验相等后,身份取 **`X-OpenSWE-User: <username>`** 头(dashboard 代理转发请求时注入,§5.2)。无该头 → 身份 `local-service`(仅允许机器级端点)。
+- **形态 B(浏览器/SDK 直连协议面,可选)**:`Bearer <token>:<username>`(分隔符 `:`)→ 校验 `token` 相等后身份 = `username`。
+- 返回 `{"identity": <username>}`;scheme 非 bearer / token 缺 / 错 / 用户头非法 → **401** `{"detail":"Invalid bearer token"}`。
+- 校验必须 `hmac.compare_digest`,且**整个协议面 + dashboard 面共享同一 token**,不引入第二份 secret。
 
 ### 3.2 登录入口(替换整个 OAuth 链)
 
-新增 `agent/dashboard/auth.py`(或并入 `routes.py`),端点挂在 `/dashboard/api`:
+新增 `agent/dashboard/auth.py`(端点挂 `/dashboard/api`):
 
 | 端点 | 行为 |
 |---|---|
-| `GET /auth/token-login` | query `token` 与 `OPEN_SWE_LOCAL_AUTH_TOKEN` 经 `hmac.compare_digest` 相等 → **200** `{}` + `Set-Cookie: osw_session=<签名值, 含 sub="local-user"、exp>`。未设 token 且 `OPEN_SWE_ALLOW_ANON=1` → **200** 发 `anon` 会话。**token 缺/错 → 401** `{"detail":"invalid token"}`(不区分"缺"和"错",防探测)。**未设 token 且未开 anon → 503** `{"detail":"auth not configured; set OPEN_SWE_LOCAL_AUTH_TOKEN"}`(fail-closed)。 |
+| `POST /auth/login` | body `{"username","token"}`。token 错 → **401** `{"detail":"invalid token"}`;注册表开启且用户不存在 → **401** `{"detail":"unknown user"}`;成功 → **200** `{"sub","name","is_admin"}` + `Set-Cookie: osw_session=…`。 |
+| `POST /auth/register` | body `{"username","token"}`(仅 admin 或首用户可建,见 §3.1.1)。成功 **201** 用户对象;重名 **409**;token 错 **401**。 |
 | `POST /auth/logout` | → **200** `{}` + `Set-Cookie: osw_session=; Max-Age=0`。无 cookie 也 200(幂等)。 |
-| `GET /me` | → **200** `{"sub":"local-user","email":null,"name":"local-user","is_admin":true}`(本变体单用户恒 admin)。会话无效/过期 → **401**。 |
+| `GET /me` | → **200** `{"sub","name","email":null,"is_admin":bool}`。会话无效/过期 → **401**。 |
+| `GET /users`(admin) | → **200** `[{"username","created_at","admin"}]`;非 admin **403**。 |
 
-会话 cookie `osw_session`:`HttpOnly`、`SameSite=Lax`(http 本地)或 `SameSite=None; Secure`(https)、`Path=/`、`Max-Age=7d`。值用 `DASHBOARD_JWT_SECRET`(HS256)签名,或退化为不透明 `secrets.token_urlsafe` 存内存(重启失效,可接受)。
+会话 cookie `osw_session`:`HttpOnly`、`SameSite=Lax`(http 本地)或 `SameSite=None; Secure`(https)、`Path=/`、`Max-Age=7d`。值用 `DASHBOARD_JWT_SECRET`(HS256)签名,`sub`=username。**不要用进程内存存会话**——双进程部署下 dashboard 与运行时是两个进程,内存会话不共享;签名 cookie 天然跨进程(只要两进程共享 `DASHBOARD_JWT_SECRET`)。
 
 ### 3.3 删除的登录模块(全部不要)
 
@@ -123,18 +146,24 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 
 > **CSRF 门保留机制**:原 `require_same_origin_for_mutations` 对非 GET 请求校验 `Origin` 白名单(取自 `DASHBOARD_BASE_URL` + `DASHBOARD_ALLOWED_ORIGINS`)。本变体**保留这个 Origin 白名单校验**(防 CSRF),只是不再为 "bearer-github-token" 开例外;静态 token 的 bearer 请求可沿用同样的豁免。本地开发未配任何 origin 时 no-op。
 
-### 3.4 权限模型(单用户)
+### 3.4 权限模型(多用户隔离)
 
-保留 `_assert_thread_owner / _assert_thread_readable / _assert_thread_postable` 的**机制**,但**改判据**:
-- owner 判据从 `metadata.github_login == session.login` 改为 **`metadata.local_user == 当前身份`**(单用户下恒真)。
-- thread metadata 里 `github_login` 字段**改名为 `local_user`**,恒等于当前身份(`local-user` / `anon`)。
-- `404 归一化`保留:线程不存在**或**非本身份 → 一律 **404**(不泄漏存在性)。单用户下 owner 判据恒真,404 只来自"线程不存在"。
+保留 `_assert_thread_owner / _assert_thread_readable / _assert_thread_postable` 的**机制**,但**改判据为多用户**:
+- owner 判据从 `metadata.github_login == session.login` 改为 **`metadata.local_user == 会话 sub`**(即登录 username)。**不再恒真**——A 用户看不到/改不了 B 用户的线程。
+- thread metadata 里 `github_login` 字段**改名为 `local_user`**,值 = 建线程者的 username;`participant_logins` 记录参与过该线程的所有 username。
+- **列表隔离**:`GET /threads*` 按 `metadata.local_user == sub` 过滤(`all=true` 仅 admin,§3.1 第 4 点)。
+- `404 归一化`保留:线程不存在**或**非本用户(且非 admin)→ 一律 **404**(不泄漏存在性,防枚举他人线程 id)。
+- **admin 例外**:admin 可读/可 cancel 任意线程(`admin/*` 端点);普通用户之间完全隔离。
+- **并发**:多个用户同时在线无互斥;同一线程同时只允许一个活跃 run(`multitask_strategy="interrupt"` 语义保留,§9.1)——后到用户发消息会**打断**前一个 run,这是产品语义,不是 bug。跨用户同线程场景(共享部署)由 `participant_logins` + 消息署名 `@<username>: ` 前缀(现网 `_attribution_prefix` 机制)区分归属。
 
-### 3.5 沙箱内 git 身份(与 GitHub 解耦)
+### 3.5 沙箱内 git 身份(多用户 commit 作者)
 
-现网 `configure_git_identity` 写死 bot 身份(`OPEN_SWE_BOT_NAME/EMAIL`)。本变体:
-- **不覆盖用户身份**——本地沙箱(`SANDBOX_TYPE=local`)用 `_scoped_git_config_env` 把 `git config --global` 指向沙箱内 `.gitconfig-sandbox`,并 `[include]` 宿主机 `~/.gitconfig` → **commit 作者 = 用户自己的 `~/.gitconfig`**。
+现网 `configure_git_identity` 写死 bot 身份(`OPEN_SWE_BOT_NAME/EMAIL`)。本变体改为**按用户**:
+- 本地沙箱(`SANDBOX_TYPE=local`)用 `_scoped_git_config_env` 把 `git config --global` 指向沙箱内 `.gitconfig-sandbox`。
+- **每个线程的 `.gitconfig-sandbox` 写入该线程 owner 的 git 身份**:优先取本地用户注册表里该用户的 `git_name`/`git_email`(§3.1.1);未配置则回退宿主机 `~/.gitconfig` 的 `[include]`(宿主默认身份)。
+- **效果**:用户 A 的线程 commit 作者是 A,用户 B 的线程 commit 作者是 B——多用户各自留痕。
 - 删除强制 bot 身份写入;2024 提示里 "Set the commit identity" 那一步**整段删除**(§11)。
+- 注意:这是**线程级**身份(一个线程只有一个 owner),不是请求级——同一线程里多人发消息,commit 仍记 owner 身份,消息归属靠 `@<username>:` 署名区分(§3.4)。
 
 ---
 
@@ -182,9 +211,11 @@ create_app():
   # 删除 slack/linear/github webhook router
 ```
 
-- **auth 钩子换成 §3 的静态 token / 开放本地**。
+- **auth 钩子换成 §3 的多用户本地 token 认证**。
 - 路由前缀约定:`dashboard_router = APIRouter(prefix="/dashboard/api")`、`plan_router = APIRouter(prefix="/dashboard/api/plan")`、`workflow_approval_router = APIRouter(prefix="/dashboard/api/workflow-approval")`。
-- `_SESSION_DEP = Depends(require_session)`:从 cookie 取会话,无效 → 401。本变体 `require_session` 返回 `{"sub": "local-user", "email": None}`(或 `anon`)。
+- `_SESSION_DEP = Depends(require_session)`:从 `osw_session` cookie 解出**当前登录用户**,无效/过期 → 401。返回 `{"sub": <username>, "name": <username>, "email": None, "is_admin": bool}`(§3.1)。
+- **协议面 auth**:挂 `agent/local_auth.py` 的 `Auth.authenticate`(§3.1.2 复合 bearer:共享 token + `X-OpenSWE-User`/`token:username` 定身份)。
+- **代理转发身份注入**:dashboard 进程内所有对运行时的 `langgraph_client()` 调用 / httpx 代理(§5.2)统一加 `Authorization: Bearer <OPEN_SWE_LOCAL_AUTH_TOKEN>` + `X-OpenSWE-User: <当前会话 sub>` 头(§3.1.2 形态 A),使运行时侧的 thread 归属/权限与当前用户一致。
 
 ### 5.2 线程核心端点(`routes.py` + `thread_api.py`)
 
@@ -192,9 +223,9 @@ create_app():
 
 | 端点 | 功能 | 成功 | 失败定义 |
 |---|---|---|---|
-| `GET /threads` | 📖 **线程列表**(侧栏/首页数据源) | query `limit(≤50,默认50)` → **200** `[ThreadListItem]` | 401 未认证 |
+| `GET /threads` | 📖 **线程列表**(侧栏/首页数据源) | query `limit(≤50,默认50)`/`all?`(admin) → **200** `[ThreadListItem]`;**按 `metadata.local_user == sub` 过滤**(多用户隔离,§3.4;`all=true` 且 admin 才看全量) | 401 未认证 |
 | `GET /threads/sidebar` | 📖 侧栏精简列表(active/resolved 两段) | **200** payload + `Server-Timing` 头 | 401 |
-| `GET /threads/page` | 📖 分页列表(过滤+排序) | query `limit(≤100,默认25)/offset/resolved?/viewed?/source?/status?/q?/scope=all\|interactive\|automation/sort_by=updated_at\|created_at` → **200** `{"items":[…],"limit","offset","hasMore":bool}`;无结果 = 200 空 items | 400 参数非法 |
+| `GET /threads/page` | 📖 分页列表(过滤+排序) | query `limit(≤100,默认25)/offset/all?(admin)/resolved?/viewed?/source?/status?/q?/scope=all\|interactive\|automation/sort_by=updated_at\|created_at` → **200** `{"items":[…],"limit","offset","hasMore":bool}`;无结果 = 200 空 items;**底层 `POST /threads/search` 的 metadata 过滤必须含 `local_user == sub`**(`all=true` 且 admin 时去掉) | 400 参数非法 |
 | `GET /threads/{id}` | 📖 **线程详情元数据**(*transcript 不在这里*——前端另调 `/state` hydrate);`mark_viewed=true` 默认置已读 | **200** ThreadListItem 全字段 | **404 归一化**(不存在或非本身份) |
 | `DELETE /threads/{id}` | 🗑️ **删线程** + 其 checkpoint/流(不可恢复) | **204** | 404 |
 | `POST /threads/{id}/resolve` | ✅ **标记已解决/未解决**(列表分组) | body `{"resolved": bool}` → **200** 更新后列表项 | 404 |
@@ -229,7 +260,7 @@ create_app():
 
 `proxy_dashboard_thread_commands` 关键逻辑:
 - `method=="run.start"` 且线程不存在 → **lazy 建线程**(`creating=True`),调 `_create_dashboard_thread_record(...)` 打全量 metadata(owner=`local_user`、title=prompt[:80]、repo、model、plan_mode)。
-- `_enrich_run_start_command`:生成 `prepare_run_id=uuid4()`,把 `injected_dynamic_context_hashes` 去重(从已有 state 的 `<dynamic-context>` 提取 hash),`build_input_messages` 重包 XML 信封(surface=`web`, sender=`local-user`),合并 `configurable`(见 §15.3),`params["assistant_id"]="agent"`,`params["stream_mode"]=_DASHBOARD_STREAM_MODES`,`params["stream_resumable"]=True`,写回 thread metadata。
+- `_enrich_run_start_command`:生成 `prepare_run_id=uuid4()`,把 `injected_dynamic_context_hashes` 去重(从已有 state 的 `<dynamic-context>` 提取 hash),`build_input_messages` 重包 XML 信封(surface=`web`, sender=`<当前会话 username>`),合并 `configurable`(见 §15.3),`params["assistant_id"]="agent"`,`params["stream_mode"]=_DASHBOARD_STREAM_MODES`,`params["stream_resumable"]=True`,写回 thread metadata。
 - 成功后异步:更新 `latest_run_status="pending"`/`latest_run_id`,`state_cache.invalidate(thread_id)`,并起一个 TTFT 观测 task(开 `runs/{run_id}/stream?stream_mode=messages` 记录首字延迟)。
 - 本变体:`_ensure_dashboard_github_token`(现网要求用户有可用 GitHub OAuth token 才能发 run)→ **删除**,换成静态 token 已通过即放行。
 
@@ -312,7 +343,7 @@ create_app():
 | 端点 | 存储 | 说明 |
 |---|---|---|
 | `GET/POST /skills`、`PUT/DELETE /skills/{name}` | store `user_skills` | name 小写字母/数字/单连字符(≤64);description ≤1024;instructions ≤20000。POST 重名 → 409;name 非法 → 400 |
-| `GET/POST /organization-skills`、`PUT/DELETE /organization-skills/{name}` | store `organization_skills` | 本地单用户可并入用户技能,保留双命名空间则同上契约 |
+| `GET/POST /organization-skills`、`PUT/DELETE /organization-skills/{name}` | store `organization_skills` | 组织级技能(所有登录用户可见,仅 admin 可写);用户级 `/skills` 按 `sub` 隔离 |
 | `GET/POST /agent-instructions`、`GET/PUT/DELETE /agent-instructions/{full_name}` | store `agent_instructions`(键 `owner/name`) | per-repo 指令,注入系统提示。full_name 非 `owner/name` → 400 |
 | `GET/PUT/DELETE /me/instructions` | store `user_instructions`(键=local_user) | 用户级指令,跨线程共享面。GET 无则 `{"instructions":""}` |
 | `GET/PUT /profile` | store `profiles`(键=local_user) | 模型默认、effort、base_branch 等本地化字段 |
@@ -336,7 +367,7 @@ create_app():
 
 ### 5.9 删除的端点(✂️,共约 60 个)
 
-`/admin/*`(evals/threads cancel/user-mappings,保留 `POST /admin/threads/{id}/cancel` 亦删,单用户不需要)、`/reviews/*` 全部(含 8 个 PR 聊天代理)、`/review-styles/*`、`/enabled-review-repos`、`/repo-snapshots*`、`/sandbox-settings`、`/environments*`、`/voice/*`、`/agent-usage-leaderboard`、`/threads/{id}/{pull-request-status, terminal/connect, recovery.patch, pr-diff}`、§3.2 所列全部 OAuth/凭据/团队端点(`/my-mapping`、`/my-credentials/*`、`/notion/*`、`/slack/*`、`/team-settings*`、`/team-credentials*`、`/repos`)。变体里访问 = 路由不存在 → **404**。
+`/admin/*` 的 evals/user-mappings(保留 `POST /admin/threads/{id}/cancel` 作为**多用户 admin 跨线程取消**,§3.4)、`/reviews/*` 全部(含 8 个 PR 聊天代理)、`/review-styles/*`、`/enabled-review-repos`、`/repo-snapshots*`、`/sandbox-settings`、`/environments*`、`/voice/*`、`/agent-usage-leaderboard`、`/threads/{id}/{pull-request-status, terminal/connect, recovery.patch, pr-diff}`、§3.2 所列全部 OAuth/凭据/团队端点(`/my-mapping`、`/my-credentials/*`、`/notion/*`、`/slack/*`、`/team-settings*`、`/team-credentials*`、`/repos`)。变体里访问 = 路由不存在 → **404**。
 
 ---
 
@@ -368,7 +399,7 @@ create_app():
 **所有入站消息统一序列化为用户消息里的 XML 信封**(让模型结构化感知发送者/渠道/系统):
 
 ```xml
-<input-message sender="local-user" surface="web" kind="human">
+<input-message sender="alice" surface="web" kind="human">
   <content>…正文(或 content blocks)…</content>
 </input-message>
 ```
@@ -377,7 +408,7 @@ create_app():
 - `build_run_input(content, context, people, channels, systems, files)`:先注入**身份介绍消息**(person/channel/system 的 `<dynamic-context>` 块,按内容 hash 去重,`injected_dynamic_context_hashes` 防重复注入),再注入真正的 `human_input`/`system_input`。
 - `Surface`(本变体只出现 `web|desktop|automation`);`kind = human|system`;无人类发送者时合成 `system:<source>` 身份。
 - 系统提示经 `wrap_system_prompt` 包进 `<system-instructions format="open-swe-v1">`,追加项以增量 `<input-message>` splice(幂等)。
-- 本变体:`PersonIdentity` 不再来自 GitHub/Slack 映射;dashboard 来源直接给一个 `local-user` 的 `<dynamic-context>`(platform=`open-swe`)。
+- 本变体:`PersonIdentity` 不再来自 GitHub/Slack 映射;dashboard 来源直接给一个**当前登录 username** 的 `<dynamic-context>`(platform=`open-swe`,id=`<username>`)。多用户下每个用户各自的身份介绍块,按内容 hash 去重(§5 机制不变)。
 
 ---
 
@@ -403,7 +434,7 @@ create_app():
 | `configurable.prepare_run_id` | 新 UUID | 关联 PrepareRun 中间件与 run |
 | `webhook` | `/webhooks/run-complete?token=…` | 完成/失败回调(§9.2) |
 
-- `dispatch_agent_run(thread_id, content, configurable, *, source=…, assistant_id="agent")`:`source` 本变体只可能是 `web|desktop|automation|schedule`。`_dispatch_input` 里抽 Slack user/channel/时区、GitHub login、Linear email 的逻辑**删除**;发送者身份退化为 `local-user`(§3)。
+- `dispatch_agent_run(thread_id, content, configurable, *, source=…, assistant_id="agent")`:`source` 本变体只可能是 `web|desktop|automation|schedule`。`_dispatch_input` 里抽 Slack user/channel/时区、GitHub login、Linear email 的逻辑**删除**;发送者身份取 **`configurable.local_user`**(即当前登录 username,§3)。
 - **触发 webhook(slack/linear/github)全部删除**——它们本就是外部平台 POST 进来的,本地无外部平台。
 
 ### 9.2 完成信号:`agent/completion.py` + `/webhooks/run-complete`
@@ -472,7 +503,8 @@ create_app():
 
 - 线程稳定分支:首次 `run.start` 时 `_create_dashboard_thread_record` 打 `branch` 到 thread metadata(如 `local/<slug>`);agent 在沙箱内 `git checkout -b <branch>` 后工作。
 - `ensure_sandbox_for_thread(thread_id, repo, …)`:repo 解析为**本地路径**(`agent/utils/repo.py` 仅本地仓库解析;`repo: owner/name` 语法仍可保留,映射到本地路径或宿主 git URL,由 `DEFAULT_REPO_OWNER` 等解析)。
-- **服务器不持有任何 GitHub token**;`gh` CLI 在本变体**不代理、不要求登录**。沙箱内 git 用宿主 `~/.gitconfig`(经 `.gitconfig-sandbox` 的 `[include]`),push 凭据由宿主自备。
+- **服务器不持有任何 GitHub token**;`gh` CLI 在本变体**不代理、不要求登录**。
+- **多用户 commit 作者**(§3.5):每个线程的 `.gitconfig-sandbox` 写入该线程 **owner 的 git 身份**(用户注册表 `git_name`/`git_email`,未配则 `[include]` 宿主 `~/.gitconfig`)。push 凭据由宿主自备(多用户共享宿主凭据;per-user push 凭据可由注册表扩展 `credential helper`,超出最简形态)。
 - 可选交付增强(前端 diff 面板):§5.8 的 `working-tree-diff`/`branch-diff` 端点(纯本地 `git diff` 物化)。
 
 ---
@@ -487,10 +519,11 @@ ANTHROPIC_API_KEY=…                  # 或 OPENAI_*/FIREWORKS_*/gateway
 # 完成 webhook(相对路径 → 进程内 loopback 投递,§9.2;token 必填)
 COMPLETION_WEBHOOK_URL=/webhooks/run-complete
 RUN_COMPLETE_WEBHOOK_SECRET=…
-# 认证(§3)
-OPEN_SWE_LOCAL_AUTH_TOKEN=…          # 未设则要求 OPEN_SWE_ALLOW_ANON=1
-OPEN_SWE_ALLOW_ANON=0                # 可选,仅裸开发
-DASHBOARD_JWT_SECRET=…               # 会话 cookie 签名(或用不透明内存会话则可不设)
+# 认证(§3,多用户)
+OPEN_SWE_LOCAL_AUTH_TOKEN=…          # 共享服务端 token;未设 → dashboard 认证面 fail-closed(503)
+CONFIGURED_ADMINS=alice,bob          # admin 用户(逗号分隔 username);可空
+OPEN_SWE_USER_REGISTRY=1             # 1=登录要求用户已存在(可 /auth/register 建);0=首登自动注册
+DASHBOARD_JWT_SECRET=…               # 会话 cookie 签名(两进程部署必须共享)
 # 沙箱(§3.5 / §4.1)
 SANDBOX_TYPE=local
 LOCAL_SANDBOX_ROOT_DIR=/path/to/work # 缺省 = 进程 cwd
@@ -521,13 +554,14 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 **本变体追加**:
 7. **进程 env 与运行时内存中 grep 不到** `GITHUB_APP` / `GITHUB_TOKEN` / 任何 OAuth token 字段;`gh` CLI 不代理、不要求登录;沙箱内 git 用宿主 `~/.gitconfig`。
 8. **交付物 = 本地分支 commit**;push/PR 永远不作为默认行为,仅用户显式要求 + 宿主凭据可用时才 push。
-9. **认证面单一**:静态 token(`hmac.compare_digest`)或显式开放本地;不存在 GitHub/OIDC/Slack 任何登录路径。
+9. **认证面单一 + 多用户**:本地 token 面(`hmac.compare_digest`);**不使用 GitHub/OIDC/Slack 任何登录路径**;支持多个用户同时登录,会话/线程/指令/skills/profile **按 username 隔离**;不存在第二份认证 secret。
 
 **最小复刻验收**:
 - [ ] `langgraph.json` 仅 `agent` + `scheduler` + `http.app` + Postgres checkpointer/store + TTL + `webhooks.disable_loopback=false` 可启动
 - [ ] `pin_single_event_loop` 在 app import 期生效且可拒绝启动(缺 `BG_JOB_ISOLATED_LOOPS` 开关时 RuntimeError)
-- [ ] 静态 token 认证:带 token 200 / 缺 token 401;开放本地模式仅在 `OPEN_SWE_ALLOW_ANON=1` 生效;auth 未配置 → 503
-- [ ] 沙箱 `SANDBOX_TYPE=local`,无 GitHub token 注入;`git config user.name/email` **未被强制覆盖**(commit 作者 = 宿主身份)
+- [ ] **多用户登录**:`POST /auth/login` 两个不同 username 各自 200 拿各自的 `osw_session` cookie;两浏览器同时在线,A 的 `/threads` **看不到** B 的线程,B 访问 A 的 `/threads/{id}` → **404**;admin(`CONFIGURED_ADMINS`)`all=true` 可看全量
+- [ ] token 校验:token 错 → 401;auth 未配置(无 token)→ 503 fail-closed;`X-OpenSWE-User`/`token:username` 复合 bearer 在协议面同样生效
+- [ ] 沙箱 `SANDBOX_TYPE=local`,无 GitHub token 注入;commit 作者 = **线程 owner 的 git 身份**(注册表 `git_name/git_email`,未配回退宿主 `~/.gitconfig`),**不是**强制 bot 身份
 - [ ] 一次 `agent` run 能:改文件 → `git commit` 到 `local/<slug>` 分支 → 汇报本地分支名,**不** push、**不**建 PR
 - [ ] `/state`(单快照 + 15s 预算 + idle 缓存 + run-in-flight 删 `next`)与 `/history`(≤5 + 90s + 合并 + 退避 3×1.5s + `/state` 降级 + 30s 快照缓存)代理
 - [ ] 超大线程(≥30MB checkpoint)下:打开线程页 P95 < 10s,期间其他线程请求不被冻结 > 1s(queue-probe 的 `lag_ms` 验证)
@@ -540,8 +574,8 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 ## 14. HTTP 协议字段盘点
 
 **14.1 认证与通用头**
-- **协议面**(`:2024` 非 `/dashboard/api`):`Authorization: Bearer <OPEN_SWE_LOCAL_AUTH_TOKEN>`(接 `agent/local_auth.py`)。成功 → 注入 `langgraph_auth_user={"identity":"local-user"}`;失败 → **401** `{"detail":"Invalid bearer token"}`。
-- **dashboard 面**:会话 cookie `osw_session`(§3.2 下发,`HttpOnly`、`SameSite=Lax`、`Path=/`)。成功 → `_SESSION_DEP` 注入 `{sub, email, name}`;失败 → **401** `{"detail":"unauthenticated"}`(前端据此跳 `/auth/token-login`)。
+- **协议面**(`:2024` 非 `/dashboard/api`):复合 bearer(§3.1.2)——`Bearer <OPEN_SWE_LOCAL_AUTH_TOKEN>` + `X-OpenSWE-User: <username>`(内部转发),或 `Bearer <token>:<username>`(浏览器/SDK 直连);身份 = username,无用户头 = `local-service`(接 `agent/local_auth.py`)。成功 → 注入 `langgraph_auth_user={"identity": <username>}`;失败 → **401** `{"detail":"Invalid bearer token"}`。
+- **dashboard 面**:会话 cookie `osw_session`(§3.2 下发,`HttpOnly`、`SameSite=Lax`、`Path=/`)。成功 → `_SESSION_DEP` 注入 `{sub: <username>, name, email: null, is_admin}`;失败 → **401** `{"detail":"unauthenticated"}`(前端据此跳登录表单 `POST /auth/login`)。
 - **CORS**(跨 origin 时):`Access-Control-Allow-Credentials: true` + 具体 origin 白名单(`DASHBOARD_ALLOWED_ORIGINS`;**禁止 `*`+credentials**,`create_app` 里 `RuntimeError` 强校验)。Origin 不在白名单 → 无 `Access-Control-Allow-Origin` 头(浏览器拦)。
 - **CSRF**:非 GET 请求校验 `Origin` 白名单(§3.3);bearer-only 请求豁免。
 - **全部 JSON 端点**:`Content-Type: application/json`(proxy 端点显式校验,非 JSON → **415**)。
@@ -568,8 +602,8 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 ```jsonc
 {
   "kind": "agent",                  // 本变体恒为 agent
-  "local_user": "local-user",       // owner 判据(替代 github_login)
-  "participant_logins": ["local-user"],
+  "local_user": "<建线程者 username>",   // owner 判据(替代 github_login)
+  "participant_logins": ["<username>", …],
   "source": "dashboard|web|automation|schedule",
   "origin": "dashboard",
   "thread_category": "interactive",
@@ -598,7 +632,7 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 |---|---|---|
 | `thread_id` | uuid | 恒有 |
 | `source` | `dashboard\|web\|automation\|schedule` | 决定 Surface 与提示分段 |
-| `local_user` | `"local-user"`(或 `anon`) | 替代 `github_login` |
+| `local_user` | `<当前登录 username>` | 替代 `github_login`;thread 归属/owner 判据(§3.4) |
 | `repo` | `{"owner","name"}` | 可缺;`repo_explicitly_none` 显式无 repo |
 | `agent_model_id` / `agent_effort` | str | 用户选模型(缺省走 profile/全局默认) |
 | `plan_mode` | bool | plan mode 开关 |
@@ -706,14 +740,15 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 |---|---|
 | **改** | `langgraph.json`(两图 + `webhooks.disable_loopback=false`)、`agent/api/app.py`(auth 钩子 + 路由裁剪)、`agent/prompt.py`(本地提交段)、`agent/server.py`(沙箱去 proxy + 工具列表)、`agent/dispatch.py`(source 收窄 + loopback 反转)、`agent/completion.py`(失败回执简化)、`agent/scheduler.py`(去 baby_sit/cost)、`agent/dashboard/routes.py`(auth 换 token + 端点裁剪)、`agent/dashboard/thread_api.py`(`github_login`→`local_user`、去 GitHub token 校验) |
 | **留** | `agent/webapp.py`、`agent/utils/event_loop.py`、`agent/postgres_persistence.py`、`agent/input_messages.py`、`agent/utils/sandbox.py`、`agent/integrations/local.py`、`agent/utils/sandbox_paths.py`、`agent/utils/queue_debug.py`、`agent/utils/thread_ops.py`、`agent/api/health.py`、`agent/dashboard/{thread_api,plan_api,plan_store,workflow_approval_api,schedules,skills,agent_instructions,user_instructions,options,profiles}.py`、`agent/middleware/{sanitize,tool_error,exclude_tools,model_call_limit,model_call_timeout,strip_thoughts,prepare_run,check_message_queue}.py`、`agent/tools/{web_search,fetch_url,http_request,save_plan,approve_plan,enter_plan_mode,schedule_thread_wakeup,background_execute,background_task,recreate_sandbox,sandbox_reset,report_platform_issue,read_user_settings,save_user_instructions,save_user_skill,delete_user_skill,output_iframe}.py` |
-| **改语义** | `agent/local_auth.py`(从死代码 → 接上,作为认证入口)、`agent/utils/repo.py`(仅本地仓库解析) |
+| **改语义** | `agent/local_auth.py`(从死代码 → 接上,改为**复合 bearer 多身份**:共享 token + `X-OpenSWE-User`/`token:username`)、`agent/utils/repo.py`(仅本地仓库解析) |
+| **新增** | `agent/dashboard/auth.py`(多用户登录/登出/`/me`/`/users`)、`agent/dashboard/user_registry.py`(本地用户注册表,store `local_users`) |
 | **删** | `agent/{reviewer,analyzer,chat,baby_sit,session_cost}.py`、`agent/review/*`、`agent/graphs/{reviewer,analyzer,chat}.py`、`agent/utils/{github_app,github_checks,github_ci,github_comments,github_feedback,github_http,github_org_membership,github_proxy,github_token}.py`、`agent/middleware/{refresh_github_proxy,pr_creation_guard,workflow_push_guard,settle_review_check}.py`、`agent/webhooks/{slack,linear,github,common}.py`(留 run-complete)、`agent/dashboard/{oauth,github_token_auth,oidc_auth,slack_oauth,notion_oauth,user_mappings,review_api,review_styles,review_style_jobs,review_chat_api,pr_diff,pull_request_status,agent_usage,repo_cache,repo_snapshots,enabled_repos,team_credentials,team_settings,admin}.py`、`agent/tools/{open_pull_request,request_pr_review,manage_baby_sit,notify_automation_channel,fetch_review_diff,publish_review,add_finding,update_finding,list_findings,read_finding_outcomes,reply_to_finding_thread,resolve_finding_thread,save_review_style,list_review_findings,admin_gate,linear_*,slack_*}.py`、`agent/integrations/{daytona,modal,runloop,e2b}.py`(只留 `local.py`)、`test_github_oauth.py` |
 
 ---
 
 ## 17. 实现顺序建议(给 AI 编程代理)
 
-1. **锁骨架**:改 `langgraph.json` 两图 + `webhooks.disable_loopback=false`;`agent/api/app.py` 换 auth 钩子(§3)+ 裁剪路由;确保空实现也能 `langgraph dev` 起 + `/health` 200。
+1. **锁骨架**:改 `langgraph.json` 两图 + `webhooks.disable_loopback=false`;`agent/api/app.py` 换 auth 钩子(§3 多用户)+ 裁剪路由;`agent/dashboard/auth.py` + `user_registry.py` 落地;确保空实现也能 `langgraph dev` 起 + `/health` 200 + 两个 username 能分别登录。
 2. **打通本地沙箱 + 本地提交**:`SANDBOX_TYPE=local`;`agent/server.py` 去 proxy 链;接 `LOCAL_COMMIT_SECTION` 提示;跑通一次"改文件 → commit 到 `local/<slug>`"。
 3. **接持久化与有界代理**:Postgres checkpointer/store(§7)+ `thread_api.py` 有界 state/history(§5.2)。
 4. **接完成 webhook**(§9.2)+ `scheduler` 裁剪(§4.2)。
@@ -722,9 +757,52 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 
 ---
 
+## 18. 两种部署拓扑(:2024 与 :8001,都要支持多用户并发登录)
+
+本变体的 dashboard 服务器与 LangGraph 运行时可以是**一个进程**,也可以是**两个进程**。两种拓扑**共用同一套认证、权限、代理代码**(`agent/api/app.py` + `agent/dashboard/*`),多用户并发登录在两种拓扑下都成立:
+
+### 18.1 拓扑 A:同进程(单部署)
+
+```
+langgraph dev (localhost:2024, 单事件循环)
+├── inmem runtime(协议面 :2024)
+├── FastAPI app(http.app 挂进同进程 → /dashboard/api/* 也在 :2024)
+└── Postgres(checkpoint/store/用户注册表)
+```
+- 浏览器只连 `:2024`(`/dashboard/api/*` 与 SSE 协议面同端口,同源,**无 CORS 问题**)。
+- 多用户并发:会话 cookie 按用户签名(§3.1),浏览器 A/B 各持各的 cookie,同进程内天然并发;`state_cache`、`_HISTORY_COALESCING` 等进程内缓存按 thread_id 键,跨用户不串。
+
+### 18.2 拓扑 B:双进程(推荐,对应现网 `make dashboard`)
+
+```
+langgraph dev (localhost:2024)            只跑 runtime + 图
+        ▲  Authorization: Bearer <token> + X-OpenSWE-User: <sub>
+        │  (进程间 bearer,§3.1.2 形态 A)
+uvicorn agent.webapp:app --port 8001      只跑 dashboard FastAPI app
+        ▲  osw_session cookie(§3.2)
+        │
+浏览器 :3000(VITE_DASHBOARD_API_BASE_URL=http://localhost:8001/dashboard/api)
+```
+- dashboard 进程(`:8001`)面向浏览器,用**会话 cookie** 认证(`_SESSION_DEP`)。
+- dashboard 进程内部对运行时的**所有**调用(`langgraph_client()` = `get_client(url=LANGGRAPH_URL)`,缺省 `http://localhost:2024`;httpx 代理同理)**统一注入** `Authorization: Bearer <OPEN_SWE_LOCAL_AUTH_TOKEN>` + `X-OpenSWE-User: <当前会话 sub>`(§5.1)→ 运行时 `agent/local_auth.py` 据此以**该用户身份**执行(§3.1.2 形态 A)。
+- **浏览器不直连 `:2024` 协议面**:所有 transcript/流/历史读取都走 `:8001` 的代理端点(§5.2 的 `/state`、`/history`、`/stream/events`、`/commands`),由 dashboard 进程带用户身份转发。
+- **多用户并发**:两进程都无状态地验签同一 `DASHBOARD_JWT_SECRET`(§3.2)→ 两个浏览器各持各的签名 cookie,并发登录/并发 run 互不影响;用户注册表、线程、store 都在**共享 Postgres** 里,跨进程一致。
+- CORS 配在 `:8001` 的 dashboard app 上(`DASHBOARD_ALLOWED_ORIGINS=http://localhost:3000`);`:2024` 协议面只接受进程间 bearer(无浏览器 cookie)。
+- 启动:`make dev`(`uv run langgraph dev`)+ `make dashboard`(`uv run uvicorn agent.webapp:app --port 8001`)。双进程下 `agent/api/app.py` import 期的 `pin_single_event_loop()` 只约束**各自进程**内的单循环(铁律不变,作用域是进程)。
+
+### 18.3 多用户并发验收(两种拓扑各过一遍)
+
+- [ ] 两个浏览器分别 `POST /auth/login`(不同 username)→ 各自 200 + 各自 cookie。
+- [ ] 各自建线程、发 run,同时执行:互不阻塞,transcript 各自只见本人线程(§3.4)。
+- [ ] A 用 B 的 thread id 直连 `:8001/dashboard/api/threads/{id}` → 404;直连 `:2024` 协议面但 `X-OpenSWE-User` 不匹配 → 运行时侧同样 404 归一化。
+- [ ] 拓扑 B 下 dashboard 进程 kill 掉,`:2024` runtime 仍存活,run 继续跑(loopback webhook 在 runtime 进程内,§9.2 不受 dashboard 进程影响)。
+
+---
+
 ## 附录 A:前端契约
 
-- 前端 hydrate 用 `GET /state`(主 transcript)+ 有界 history 发现页,`VITE_DASHBOARD_API_BASE_URL` 指向 `:2024` 的 `/dashboard/api`。
+- 前端 hydrate 用 `GET /state`(主 transcript)+ 有界 history 发现页,`VITE_DASHBOARD_API_BASE_URL` 指向 dashboard 服务器的 `/dashboard/api`(同进程部署为 `:2024`,双进程部署为 `:8001`,§18)。
 - **删除**所有 PR/review/OAuth 页与组件,只留 Agents 线程列表 + 聊天 + plan 审批。
-- 登录:一个输入 token 的表单 → `GET /auth/token-login?token=…` → 跳回。
+- **多用户登录页**:表单收集 `username` + `token` → `POST /dashboard/api/auth/login` → 成功 `Set-Cookie: osw_session` 后跳回 Agents 列表;`GET /me` 的 `is_admin` 决定是否显示 admin 菜单;`POST /auth/logout` 清 cookie。
+- **多用户隔离**:线程列表/详情只返回本人线程(后端按 `local_user` 过滤);admin 可看 `all=true` 全量。前端不自行拼身份,一切以 cookie 会话为准。
 - SSE 用 `@langchain/react` 的 `StreamProvider`/`StreamController`(v2 事件流 `POST …/stream/events`);stop 按钮调 `POST …/cancel`。
