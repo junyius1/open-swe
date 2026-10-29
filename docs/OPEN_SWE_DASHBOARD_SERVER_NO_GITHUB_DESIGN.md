@@ -37,6 +37,7 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 | 身份/登录 | GitHub OAuth(`oauth.py`)+ PKCE + org 门 | **多用户本地 token 认证**:共享服务端 token 换 per-user 会话(可选本地用户注册表);**不用 GitHub** | `agent/local_auth.py`、`agent/dashboard/auth.py`(新增)、`agent/dashboard/user_registry.py`(新增)、`routes.py` |
 | 注册图 | 5 个:agent/reviewer/analyzer/chat/scheduler | **2 个:agent + scheduler** | `langgraph.json`、`agent/graphs/*` |
 | 沙箱 | 6 种 provider(langsmith/daytona/modal/runloop/e2b/local)+ 每沙箱注入 GitHub App token 作 `gh` 代理 | **删掉全部 5 种云 provider;唯一 provider = 新增本地 `docker`**(`SANDBOX_TYPE=docker`,每线程一个容器,无任何 token);`local` 仅作裸开发回退 | `agent/integrations/docker.py`(新增)、`agent/utils/sandbox.py`、`agent/server.py` |
+| LLM 并发 | 各 run 直接并发调 LLM | **可切换**:队列模式(串行,`OPEN_SWE_LLM_MAX_CONCURRENCY=1`,适配 vLLM `--max-num-seqs 1`)/ 并发模式(≥2),进程内 FIFO gate | `agent/utils/llm_gate.py`(新增)、`agent/server.py` 中间件栈、`agent/api/health.py` 观测端点 |
 | 提交交付 | `open_pull_request` 工具 + PR 守卫中间件 + PR 提示段 | **仅本地分支 commit**;push 可选;`LOCAL_COMMIT_SECTION` 提示 | `agent/prompt.py`、工具列表 |
 | Webhook 触发 | Slack/Linear/GitHub + run-complete | **只保留 run-complete**(进程内 loopback) | `agent/webhooks/*`、`agent/dispatch.py` |
 | Dashboard 端点 | 117 个,含大量 PR/review/OAuth | 裁剪到 **线程/消息/state-history/plan/workflow/schedules/skills/health** | `agent/dashboard/*` |
@@ -504,6 +505,29 @@ create_app():
 
 ---
 
+## 9.5 LLM 调用并发控制(队列模式 / 并发模式)
+
+**背景**:本地 vLLM 常以 `--max-num-seqs 1` 启动(同时只处理 1 个序列)。多用户/多线程场景下,多个 run **不能并发向 LLM 发请求**——直接并发会 429/报错。服务器层提供**两种可切换模式**(env 切换,默认队列):
+
+| 模式 | `OPEN_SWE_LLM_MAX_CONCURRENCY` | 语义 |
+|---|---|---|
+| **队列(串行)** | `1`(默认) | 全进程同一时刻**最多 1 个**进行中的 LLM 调用;其余在**进程内 FIFO 队列**等待,轮到才发出。适配 `--max-num-seqs 1` 的 vLLM。 |
+| **并发** | `N ≥ 2`(或读 vLLM `/v1/loads` 的 `num_seqs` 上限自动定) | 全进程**最多 N 个**并发 LLM 调用。 |
+
+**实现落点**(`agent/utils/llm_gate.py`,新增):
+- `make_model()`(`agent/utils/model.py`;本变体主要走 `local:<path>` 分支,`base_url=LOCAL_LLM_BASE_URL`)返回的 model 调用外面包 gate:模块级 `asyncio.Semaphore(OPEN_SWE_LLM_MAX_CONCURRENCY)`(缺省 1)。
+- **gate 层级**:新增 `LLMGateMiddleware`,`awrap_model_call = async with gate: await handler(request)`,挂在现有 `ModelCallTimeoutMiddleware` 的**外层**——**排队时间不计模型调用超时**(`OPEN_SWE_MODEL_CALL_TIMEOUT_SECONDS` 从拿到 gate 后开始计)。
+- **FIFO**:`asyncio.Semaphore` 在单事件循环(§1)上天然全进程唯一;等待者按到达顺序放行,放行时 log `llm-gate: thread=… 获得槽位(等待 X s)`。
+- **多用户交互**:用户 A 的 run 正在调 LLM,用户 B 的 run 到模型步 → B 的 run 状态仍 `running`,LLM 调用在 gate 里排队(前端可显示"等待 LLM");A 的调用结束 → B 放行。**跨线程排队**;同一线程的 follow-up 仍走 store 队列(`check_message_queue`,run 内注入),两机制不冲突。
+- **interrupt 交互**:`multitask_strategy="interrupt"` 的被打断 run 释放 gate,替换 run 接着排队。
+- **观测端点**:`GET /debug/llm-gate`(挂进 §5.7 health/debug 组)→ `{"mode":"queue"|"concurrent","max_concurrency":int,"in_flight":int,"waiting":[{thread_id,queued_at_ms}]}`。
+- **验收**:
+  - [ ] `=1`:两线程同时 run,`in_flight ≤ 1`,vLLM 无 429,第二个 FIFO 放行。
+  - [ ] `=2`:两线程真并发(vLLM `num_seqs` 同时 2),第三个等释放。
+  - [ ] 排队不计超时:排队 120s 后调用正常完成。
+
+---
+
 ## 10. 系统提示(`agent/prompt.py`)
 
 装配框架(`construct_system_prompt` 分段拼接、`<system-instructions>` 包裹、幂等 splice)**保留**。逐段改动:
@@ -560,6 +584,8 @@ DOCKER_SANDBOX_IMAGE=python:3.12-slim   # 需自带 git;宿主可预 pull
 # 前端跨源
 DASHBOARD_ALLOWED_ORIGINS=http://localhost:3000
 DASHBOARD_BASE_URL=http://localhost:3000   # CSRF Origin 白名单来源
+# LLM 并发控制(§9.5)
+OPEN_SWE_LLM_MAX_CONCURRENCY=1   # 1=队列(串行,适配 vLLM --max-num-seqs 1);≥2=并发
 # 可选调试
 OPEN_SWE_QUEUE_DEBUG=1
 OPEN_SWE_STREAM_IDLE_TIMEOUT_SECONDS=60
@@ -584,7 +610,8 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 **本变体追加**:
 7. **进程 env 与运行时内存中 grep 不到** `GITHUB_APP` / `GITHUB_TOKEN` / 任何 OAuth/云沙箱(E2B/Daytona/Modal/Runloop)token 字段;`gh` CLI 不代理、不要求登录;沙箱 = 本地 Docker 容器,git 身份经容器内挂载的 `.gitconfig-sandbox` 注入,容器内无宿主 `~/.gitconfig`、无任何 token。
 8. **交付物 = 本地分支 commit**;push/PR 永远不作为默认行为,仅用户显式要求 + 宿主凭据可用时才 push。
-9. **认证面单一 + 多用户**:本地 token 面(`hmac.compare_digest`);**不使用 GitHub/OIDC/Slack 任何登录路径**;支持多个用户同时登录,会话/线程/指令/skills/profile **按 username 隔离**;不存在第二份认证 secret。
+9.5 **LLM 调用有界**:全进程同一时刻进行中的 LLM 调用 ≤ `OPEN_SWE_LLM_MAX_CONCURRENCY`;跨线程排队为进程内 FIFO,排队时间不计模型调用超时。
+10. **认证面单一 + 多用户**:本地 token 面(`hmac.compare_digest`);**不使用 GitHub/OIDC/Slack 任何登录路径**;支持多个用户同时登录,会话/线程/指令/skills/profile **按 username 隔离**;不存在第二份认证 secret。
 
 **最小复刻验收**:
 - [ ] `langgraph.json` 仅 `agent` + `scheduler` + `http.app` + Postgres checkpointer/store + TTL + `webhooks.disable_loopback=false` 可启动
@@ -773,7 +800,7 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 | **留** | `agent/webapp.py`、`agent/utils/event_loop.py`、`agent/postgres_persistence.py`、`agent/input_messages.py`、`agent/utils/sandbox.py`、`agent/integrations/local.py`、`agent/utils/sandbox_paths.py`、`agent/utils/queue_debug.py`、`agent/utils/thread_ops.py`、`agent/api/health.py`、`agent/dashboard/{thread_api,plan_api,plan_store,workflow_approval_api,schedules,skills,agent_instructions,user_instructions,options,profiles}.py`、`agent/middleware/{sanitize,tool_error,exclude_tools,model_call_limit,model_call_timeout,strip_thoughts,prepare_run,check_message_queue}.py`、`agent/tools/{web_search,fetch_url,http_request,save_plan,approve_plan,enter_plan_mode,schedule_thread_wakeup,background_execute,background_task,recreate_sandbox,sandbox_reset,report_platform_issue,read_user_settings,save_user_instructions,save_user_skill,delete_user_skill,output_iframe}.py` |
 | **改语义** | `agent/local_auth.py`(从死代码 → 接上,改为**复合 bearer 多身份**:共享 token + `X-OpenSWE-User`/`token:username`)、`agent/utils/repo.py`(仅本地仓库解析) |
 | **删** | `agent/{reviewer,analyzer,chat,baby_sit,session_cost}.py`、`agent/review/*`、`agent/graphs/{reviewer,analyzer,chat}.py`、`agent/utils/{github_app,github_checks,github_ci,github_comments,github_feedback,github_http,github_org_membership,github_proxy,github_token}.py`、`agent/middleware/{refresh_github_proxy,pr_creation_guard,workflow_push_guard,settle_review_check}.py`、`agent/webhooks/{slack,linear,github,common}.py`(留 run-complete)、`agent/dashboard/{oauth,github_token_auth,oidc_auth,slack_oauth,notion_oauth,user_mappings,review_api,review_styles,review_style_jobs,review_chat_api,pr_diff,pull_request_status,agent_usage,repo_cache,repo_snapshots,enabled_repos,team_credentials,team_settings,admin}.py`、`agent/tools/{open_pull_request,request_pr_review,manage_baby_sit,notify_automation_channel,fetch_review_diff,publish_review,add_finding,update_finding,list_findings,read_finding_outcomes,reply_to_finding_thread,resolve_finding_thread,save_review_style,list_review_findings,admin_gate,linear_*,slack_*}.py`、`agent/integrations/{langsmith,daytona,modal,runloop,e2b}.py`(5 种云 provider 全删;`local.py` 保留为裸开发回退)、`test_github_oauth.py` |
-| **新增** | `agent/integrations/docker.py`(本地 Docker 沙箱 provider,§4.4)、`agent/dashboard/auth.py`(多用户登录/登出/`/me`/`/users`)、`agent/dashboard/user_registry.py`(本地用户注册表,store `local_users`) |
+| **新增** | `agent/integrations/docker.py`(本地 Docker 沙箱 provider,§4.4)、`agent/dashboard/auth.py`(多用户登录/登出/`/me`/`/users`)、`agent/dashboard/user_registry.py`(本地用户注册表,store `local_users`)、`agent/utils/llm_gate.py` + `LLMGateMiddleware`(LLM 并发 gate,§9.5) |
 
 
 ---

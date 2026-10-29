@@ -222,6 +222,32 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
 
 ---
 
+## 10.5 LLM 调用并发控制(队列模式 / 并发模式)
+
+**背景**:本地 vLLM 常以 `--max-num-seqs 1` 启动(同时只处理 1 个序列)。此时多个线程/用户的 run **不能并发向 LLM 发请求**——直接并发会触发 vLLM 429/排队/报错。服务器层提供**两种可切换模式**(env 切换,默认队列):
+
+| 模式 | `OPEN_SWE_LLM_MAX_CONCURRENCY` | 语义 |
+|---|---|---|
+| **队列(串行)** | `1`(默认) | 全进程同一时刻**最多 1 个**进行中的 LLM 调用;其余调用在**进程内队列**里按 FIFO 等待,轮到才发出。适配 `--max-num-seqs 1` 的 vLLM。 |
+| **并发** | `N ≥ 2`(或读 vLLM `/v1/loads` 的 `num_seqs` 上限自动定) | 全进程**最多 N 个**并发 LLM 调用。适配更高并发的本地/云端后端。 |
+
+**实现落点**(`agent/utils/llm_gate.py`,新增):
+- `make_model()`(`agent/utils/model.py`)返回的 chat model 外面包一层 **gate**:模块级 `asyncio.Semaphore(OPEN_SWE_LLM_MAX_CONCURRENCY)`(缺省 1)。所有 `local:`/任意 provider 的 model call 过同一个 gate(单用户本地部署 = 一个 LLM 后端;若多 base_url 可按 base_url 分 gate)。
+- **gate 挂在哪一层**:`agent/middleware/` 现有 `ModelCallTimeoutMiddleware.awrap_model_call` 的**外层**再包一层 `LLMGateMiddleware`(`awrap_model_call = async with gate: await handler(request)`)。位置在 timeout 之外 = **等待 gate 的时间不算模型调用超时**(排队 5 分钟不触发 `OPEN_SWE_MODEL_CALL_TIMEOUT_SECONDS` 的误杀);拿到 gate 后才开始计 timeout。
+- **为什么进程内 semaphore 就够**:§1 单事件循环铁律保证所有 model call 都跑在同一个 loop 上,`asyncio.Semaphore` 天然是全进程唯一的 FIFO 闸;不需要 Redis/外部队列。多进程部署(dashboard 独立进程)下 dashboard 进程不直接调 LLM,无冲突。
+- **队列语义(FIFO)**:semaphore 的等待者按获得顺序放行;每个等待者持有 run 级上下文(thread_id),放行时 log `llm-gate: thread=… 获得槽位(等待 X s)`。
+- **与现有机制的关系(不冲突)**:
+  - 同一线程的 follow-up 消息仍走 store 队列(`check_message_queue` 中间件,run 内注入)——那是**线程内**语义;本节是**跨线程**的 LLM 层排队。
+  - `multitask_strategy="interrupt"` 不变:新 run 可以打断旧 run,但被挤掉的 LLM 调用释放 gate,新 run 的调用接着排队。
+  - SSE/前端:run 状态仍是 `running`(LLM 在 gate 里排队时不引入新状态);前端可加"等待 LLM"提示(读 §观测端点)。
+- **观测端点**:`GET /debug/llm-gate`(加进 `agent/api/health.py` 的 router,§9 保留组)→ `{"mode": "queue"|"concurrent", "max_concurrency": int, "in_flight": int, "waiting": [ {thread_id, queued_at_ms} ]}`。
+- **验收**:
+  - [ ] `OPEN_SWE_LLM_MAX_CONCURRENCY=1`:两个线程同时跑 run,`/debug/llm-gate` 显示 `in_flight ≤ 1`;vLLM 侧无 429;第二个线程的 LLM 调用在第一个结束后开始(FIFO,`queued_at` 顺序)。
+  - [ ] `=2`:两个线程可真正并发(vLLM `num_seqs` 同时为 2),第三个等前两个之一释放。
+  - [ ] 排队时间不计入 `OPEN_SWE_MODEL_CALL_TIMEOUT_SECONDS`(排队 120s 后调用正常完成,不误报超时)。
+
+---
+
 ## 11. 环境变量清单(最终)
 
 ```
@@ -238,6 +264,8 @@ OPEN_SWE_LOCAL_AUTH_TOKEN=…          # 未设则要求 OPEN_SWE_ALLOW_ANON=1
 SANDBOX_TYPE=docker
 DOCKER_SANDBOX_IMAGE=python:3.12-slim   # 需自带 git
 # 裸开发回退(无 Docker):SANDBOX_TYPE=local + LOCAL_SANDBOX_ROOT_DIR=/path/to/work
+# LLM 并发控制(§10.5)
+OPEN_SWE_LLM_MAX_CONCURRENCY=1   # 1=队列(串行,适配 vLLM --max-num-seqs 1);≥2=并发
 # 可选调试
 OPEN_SWE_QUEUE_DEBUG=1
 ```
@@ -252,7 +280,8 @@ OPEN_SWE_QUEUE_DEBUG=1
 
 7. **进程内与运行时不持有任何 GitHub/Slack/Linear/云沙箱(E2B/Daytona/Modal/Runloop)凭据**;`gh` CLI 在本变体**不代理、不要求登录**——沙箱 = 本地 Docker 容器,git 身份经容器内挂载的 `.gitconfig-sandbox` 注入,容器内无宿主 `~/.gitconfig`、无任何 token。
 8. **交付物 = 本地分支 commit**;push/PR 永远不作为默认行为,仅用户显式要求 + 宿主凭据可用时才 push。
-9. **认证面单一**:静态 token(`hmac.compare_digest`)或显式开放本地;不存在 GitHub/OIDC/Slack 任何登录路径。
+9.5 **LLM 调用有界**:全进程同一时刻进行中的 LLM 调用 ≤ `OPEN_SWE_LLM_MAX_CONCURRENCY`;等待在进程内 FIFO 队列,排队时间不计模型超时。
+10. **认证面单一**:静态 token(`hmac.compare_digest`)或显式开放本地;不存在 GitHub/OIDC/Slack 任何登录路径。
 
 **最小复刻验收(本变体)**:
 - [ ] `langgraph.json` 仅 `agent` + `scheduler` + `http.app` + Postgres checkpointer/store + TTL 可启动
