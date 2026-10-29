@@ -36,7 +36,7 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 |---|---|---|---|
 | 身份/登录 | GitHub OAuth(`oauth.py`)+ PKCE + org 门 | **多用户本地 token 认证**:共享服务端 token 换 per-user 会话(可选本地用户注册表);**不用 GitHub** | `agent/local_auth.py`、`agent/dashboard/auth.py`(新增)、`agent/dashboard/user_registry.py`(新增)、`routes.py` |
 | 注册图 | 5 个:agent/reviewer/analyzer/chat/scheduler | **2 个:agent + scheduler** | `langgraph.json`、`agent/graphs/*` |
-| 沙箱鉴权 | 每沙箱注入 GitHub App token 作 `gh` 代理 | **无任何 GitHub token**;`SANDBOX_TYPE=local`,git 走宿主 `~/.gitconfig` | `agent/server.py`、`agent/utils/sandbox.py` |
+| 沙箱 | 6 种 provider(langsmith/daytona/modal/runloop/e2b/local)+ 每沙箱注入 GitHub App token 作 `gh` 代理 | **删掉全部 5 种云 provider;唯一 provider = 新增本地 `docker`**(`SANDBOX_TYPE=docker`,每线程一个容器,无任何 token);`local` 仅作裸开发回退 | `agent/integrations/docker.py`(新增)、`agent/utils/sandbox.py`、`agent/server.py` |
 | 提交交付 | `open_pull_request` 工具 + PR 守卫中间件 + PR 提示段 | **仅本地分支 commit**;push 可选;`LOCAL_COMMIT_SECTION` 提示 | `agent/prompt.py`、工具列表 |
 | Webhook 触发 | Slack/Linear/GitHub + run-complete | **只保留 run-complete**(进程内 loopback) | `agent/webhooks/*`、`agent/dispatch.py` |
 | Dashboard 端点 | 117 个,含大量 PR/review/OAuth | 裁剪到 **线程/消息/state-history/plan/workflow/schedules/skills/health** | `agent/dashboard/*` |
@@ -156,12 +156,12 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 - **admin 例外**:admin 可读/可 cancel 任意线程(`admin/*` 端点);普通用户之间完全隔离。
 - **并发**:多个用户同时在线无互斥;同一线程同时只允许一个活跃 run(`multitask_strategy="interrupt"` 语义保留,§9.1)——后到用户发消息会**打断**前一个 run,这是产品语义,不是 bug。跨用户同线程场景(共享部署)由 `participant_logins` + 消息署名 `@<username>: ` 前缀(现网 `_attribution_prefix` 机制)区分归属。
 
-### 3.5 沙箱内 git 身份(多用户 commit 作者)
+### 3.5 沙箱内 git 身份(多用户 commit 作者,经 Docker 容器注入)
 
-现网 `configure_git_identity` 写死 bot 身份(`OPEN_SWE_BOT_NAME/EMAIL`)。本变体改为**按用户**:
-- 本地沙箱(`SANDBOX_TYPE=local`)用 `_scoped_git_config_env` 把 `git config --global` 指向沙箱内 `.gitconfig-sandbox`。
-- **每个线程的 `.gitconfig-sandbox` 写入该线程 owner 的 git 身份**:优先取本地用户注册表里该用户的 `git_name`/`git_email`(§3.1.1);未配置则回退宿主机 `~/.gitconfig` 的 `[include]`(宿主默认身份)。
-- **效果**:用户 A 的线程 commit 作者是 A,用户 B 的线程 commit 作者是 B——多用户各自留痕。
+现网 `configure_git_identity` 写死 bot 身份(`OPEN_SWE_BOT_NAME/EMAIL`)。本变体改为**按用户、经容器挂载**:
+- **每个线程一个 Docker 容器**(`SANDBOX_TYPE=docker`,§4.1);容器启动时把该线程的 `.gitconfig-sandbox` **挂载进容器**并设 `GIT_CONFIG_GLOBAL=/workspace/.gitconfig-sandbox`(机制同 `local.py` 的 `_scoped_git_config_env`,只是作用域从宿主文件变成容器挂载)。
+- **`.gitconfig-sandbox` 内容 = 该线程 owner 的 git 身份**:优先取本地用户注册表里该用户的 `git_name`/`git_email`(§3.1.1);未配置则回退宿主机 `~/.gitconfig` 的 `user.name`/`user.email` 值(读出来写进容器文件,不做 `[include]` 宿主文件)。
+- **效果**:用户 A 的线程 commit 作者是 A,用户 B 的线程 commit 作者是 B——多用户各自留痕,且互不污染宿主环境。
 - 删除强制 bot 身份写入;2024 提示里 "Set the commit identity" 那一步**整段删除**(§11)。
 - 注意:这是**线程级**身份(一个线程只有一个 owner),不是请求级——同一线程里多人发消息,commit 仍记 owner 身份,消息归属靠 `@<username>:` 署名区分(§3.4)。
 
@@ -172,7 +172,7 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 ### 4.1 `agent`(主编程 agent,`agent/server.py` 工厂)
 
 - 用 **`deepagents.create_deep_agent`** 构建。`system_prompt=""`(运行时由 `PrepareRun` 中间件渲染注入 `rendered_system_prompt` 通道)。
-- **后端:每线程一个本地沙箱**。`ensure_sandbox_for_thread(thread_id, repo, ...)` **去掉** `github_proxy_token`/`github_proxy_repositories`/`base_proxy_config` 参数与 `_resolve_proxy_token`/`_create_sandbox_with_proxy`/`_refresh_github_proxy` 整条链——直接 `create_sandbox()`(此时 `SANDBOX_TYPE=local`)。`backend.start()` 在工厂里调用,run 结束不销毁(线程复用)。沙箱缓存/复用/循环亲和不变。
+- **后端:每线程一个 Docker 沙箱**(§4.4)。`ensure_sandbox_for_thread(thread_id, repo, ...)` **去掉** `github_proxy_token`/`github_proxy_repositories`/`base_proxy_config` 参数与 `_resolve_proxy_token`/`_create_sandbox_with_proxy`/`_refresh_github_proxy` 整条链——直接 `create_sandbox()`(此时 `SANDBOX_TYPE=docker`)。`backend.start()` 在工厂里调用,run 结束不销毁(容器保持,线程复用)。沙箱缓存/复用/循环亲和不变。
 - 子代理:`general-purpose`(完整沙箱工具)保留;`browser` 可选(不依赖 GitHub)。
 - plan mode / skills / repo instructions 保留;Linear 工单上下文**删除**。
 - 工具列表见 §6。
@@ -190,6 +190,34 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 
 `reviewer` / `analyzer` / `chat` 全删。随之删除:`agent/review/*`、`agent/chat.py`、`agent/analyzer.py`、`agent/reviewer.py`、`agent/dashboard/{review_api,review_styles,review_style_jobs,review_chat_api,pr_diff,pull_request_status,repo_cache,repo_snapshots,enabled_repos,agent_usage}.py`。
 
+### 4.4 本地 Docker 沙箱 provider(新增 `agent/integrations/docker.py`)
+
+**目标**:替代全部 5 种云 provider(langsmith/daytona/modal/runloop/e2b 全删),唯一 provider = `docker`,每线程一个容器,跑在宿主机 Docker daemon 上。**服务器不注入任何云/GitHub token**,只需宿主可达 Docker socket。
+
+**接线**(扩展点,改动极小):
+- `agent/utils/sandbox.py` 的 `SANDBOX_FACTORIES` 是纯 dict(`name → (module, function)`):加一行 `"docker": ("agent.integrations.docker", "create_docker_sandbox")`;删掉 `langsmith/daytona/modal/runloop/e2b` 五个条目(以及对应 `integrations/{langsmith,daytona,modal,runloop,e2b}.py` 文件,§16)。
+- `validate_sandbox_startup_config()` 加 `docker` 分支:校验 Docker daemon 可达(`docker info` 成功)+ 默认镜像可解析,失败启动即报错(同现有 provider 的 boot-time 校验语义)。
+- `SANDBOX_TYPE` 缺省值从 `langsmith` 改为 **`docker`**。
+
+**provider 契约**(`create_docker_sandbox(sandbox_id) -> SandboxBackendProtocol`,参考 `local.py` 的 `LocalShellBackend` 写法):
+
+| 步骤 | 行为 |
+|---|---|
+| **镜像** | `DOCKER_SANDBOX_IMAGE`(env,缺省 `python:3.12-slim`,需自带 git;镜像由宿主预 pull 或首次创建时 pull)。 |
+| **命名/复用** | 容器名 `oswe-sbx-<thread_id 前 12 位>`;`create_docker_sandbox(sandbox_id)`:sandbox_id(= 容器名)已存在且存活 → 复用;已删除 → 报错(`SandboxGoneError`,调用方重建);不存在 → 新建。 |
+| **创建参数** | `docker create`:工作目录 `/workspace/<repo>`;`-v <宿主仓库绝对路径>:/workspace/<repo>`(bind mount,git 对象库共享宿主);`-v <宿主线程序列化 .gitconfig-sandbox>:/workspace/.gitconfig-sandbox:ro`;env `GIT_CONFIG_GLOBAL=/workspace/.gitconfig-sandbox`;`-e SANDBOX_THREAD_ID=<thread_id>`;默认 `--network=bridge`(可 `DOCKER_SANDBOX_NETWORK=none` 断网);**不挂** Docker socket、**不注入**任何 API key env。 |
+| **start** | 首启 `docker start -d`;之后每次 run 的 `backend.start()` = 检查存活(`docker inspect` 的 `State.Running`),死了则 start,仍失败 → `SandboxGoneError`。 |
+| **命令执行** | `execute(cmd)` = `docker exec -i -w /workspace/<repo> <容器> sh -lc <cmd>`;流式 stdout/stderr;超时 = `SIGTERM` 后 `SIGKILL` 该 exec 进程(不杀容器)。 |
+| **文件操作** | `ls/read/write/glob/grep` 优先走 **bind mount 的宿主路径直读**(零拷贝、快);仅当仓库不在本地 bind 时回退 `docker exec cat/ls`。 |
+| **生命周期** | run 结束**不销毁**(线程复用,同现网);线程删除(`DELETE /threads/{id}`)时 best-effort `docker rm -f`(失败只告警);`recreate_sandbox` 工具 = `docker rm -f` + 重新创建。 |
+| **资源** | 可选 `-m`(内存)/`--cpus` 上限,env `DOCKER_SANDBOX_MEM`/`DOCKER_SANDBOX_CPUS`,缺省不限。 |
+
+**多用户/隔离要点**:
+- 每个线程的容器独立挂载各自仓库目录与 `.gitconfig-sandbox` → **commit 作者按 owner 隔离**(§3.5)、各线程工作区互不污染。
+- 容器内**没有**宿主 `~/.gitconfig`(不 include)、没有 GitHub token、没有 `gh` 代理 → 不变式 7("无 GitHub 凭据")在沙箱层面天然成立。
+- push 凭据:宿主仓库目录是 bind mount,push 时容器内 git 走宿主仓库的 credential 配置(如需隔离,可加 `-v <per-user credential 目录>:/home/sbx/.git-credentials:ro`,超出最简形态)。
+- **`local` provider 保留为裸开发回退**(`SANDBOX_TYPE=local`,无 Docker 环境时),不删文件,但不再是推荐默认。
+
 ---
 
 ## 5. Dashboard 业务层
@@ -199,7 +227,7 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 ```
 create_app():
   lifespan: pin_single_event_loop()(二次)
-            → validate_sandbox_startup_config()(校验 SANDBOX_TYPE=local 的 env)
+            → validate_sandbox_startup_config()(校验 SANDBOX_TYPE=docker:daemon 可达 + 镜像可解析)
             → validate_local_dev_llm_config()
             退出: close_cached_models()
   add_middleware(QueueDebugMiddleware)  # OPEN_SWE_QUEUE_DEBUG=1 启用每秒事件循环 lag 探针
@@ -504,7 +532,7 @@ create_app():
 - 线程稳定分支:首次 `run.start` 时 `_create_dashboard_thread_record` 打 `branch` 到 thread metadata(如 `local/<slug>`);agent 在沙箱内 `git checkout -b <branch>` 后工作。
 - `ensure_sandbox_for_thread(thread_id, repo, …)`:repo 解析为**本地路径**(`agent/utils/repo.py` 仅本地仓库解析;`repo: owner/name` 语法仍可保留,映射到本地路径或宿主 git URL,由 `DEFAULT_REPO_OWNER` 等解析)。
 - **服务器不持有任何 GitHub token**;`gh` CLI 在本变体**不代理、不要求登录**。
-- **多用户 commit 作者**(§3.5):每个线程的 `.gitconfig-sandbox` 写入该线程 **owner 的 git 身份**(用户注册表 `git_name`/`git_email`,未配则 `[include]` 宿主 `~/.gitconfig`)。push 凭据由宿主自备(多用户共享宿主凭据;per-user push 凭据可由注册表扩展 `credential helper`,超出最简形态)。
+- **多用户 commit 作者**(§3.5):每个线程的 `.gitconfig-sandbox` 写入该线程 **owner 的 git 身份**(用户注册表 `git_name`/`git_email`,未配则读取宿主 `~/.gitconfig` 的 `user.name`/`user.email` 值写进去),经 Docker 容器挂载生效(§4.4)。push 凭据由宿主自备(容器 bind mount 宿主仓库目录,push 走宿主仓库的 credential 配置;per-user push 凭据可由注册表扩展,超出最简形态)。
 - 可选交付增强(前端 diff 面板):§5.8 的 `working-tree-diff`/`branch-diff` 端点(纯本地 `git diff` 物化)。
 
 ---
@@ -524,9 +552,11 @@ OPEN_SWE_LOCAL_AUTH_TOKEN=…          # 共享服务端 token;未设 → dashbo
 CONFIGURED_ADMINS=alice,bob          # admin 用户(逗号分隔 username);可空
 OPEN_SWE_USER_REGISTRY=1             # 1=登录要求用户已存在(可 /auth/register 建);0=首登自动注册
 DASHBOARD_JWT_SECRET=…               # 会话 cookie 签名(两进程部署必须共享)
-# 沙箱(§3.5 / §4.1)
-SANDBOX_TYPE=local
-LOCAL_SANDBOX_ROOT_DIR=/path/to/work # 缺省 = 进程 cwd
+# 沙箱(§3.5 / §4.4,唯一 provider = 本地 Docker)
+SANDBOX_TYPE=docker
+DOCKER_SANDBOX_IMAGE=python:3.12-slim   # 需自带 git;宿主可预 pull
+# 可选:DOCKER_SANDBOX_NETWORK=bridge|none、DOCKER_SANDBOX_MEM=2g、DOCKER_SANDBOX_CPUS=2
+# 裸开发回退(无 Docker 环境):SANDBOX_TYPE=local + LOCAL_SANDBOX_ROOT_DIR=/path/to/work
 # 前端跨源
 DASHBOARD_ALLOWED_ORIGINS=http://localhost:3000
 DASHBOARD_BASE_URL=http://localhost:3000   # CSRF Origin 白名单来源
@@ -537,7 +567,7 @@ OPEN_SWE_STREAM_MAX_LIFETIME_SECONDS=14400
 DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 ```
 
-**删除的 env**:`GITHUB_APP_ID`、`GITHUB_APP_PRIVATE_KEY`、`GITHUB_APP_INSTALLATION_ID`、`GITHUB_APP_CLIENT_ID/SECRET`、`GITHUB_TOKEN`、`SLACK_*`、`LINEAR_*`、`ALLOWED_GITHUB_ORGS`、所有 OAuth client/secret、`LANGSMITH_*` 沙箱 token(仅当仍用 LangSmith 追踪时保留,与凭据无关)、`OPEN_SWE_BOT_NAME/EMAIL`(不再强制 bot 身份)。
+**删除的 env**:`GITHUB_APP_ID`、`GITHUB_APP_PRIVATE_KEY`、`GITHUB_APP_INSTALLATION_ID`、`GITHUB_APP_CLIENT_ID/SECRET`、`GITHUB_TOKEN`、`SLACK_*`、`LINEAR_*`、`ALLOWED_GITHUB_ORGS`、所有 OAuth client/secret、`E2B_API_KEY`/`E2B_TEMPLATE`、`DAYTONA_API_KEY`/`DAYTONA_SANDBOX_SNAPSHOT`、Modal SDK 凭据、`RUNLOOP_API_KEY`、`LANGSMITH_*` 沙箱 token(仅当仍用 LangSmith 追踪时保留,与凭据无关)、`OPEN_SWE_BOT_NAME/EMAIL`(不再强制 bot 身份)。
 
 ---
 
@@ -552,7 +582,7 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 6. checkpointer TTL 12h 删除;业务状态放 thread metadata / store,不依赖 checkpoint 长存。
 
 **本变体追加**:
-7. **进程 env 与运行时内存中 grep 不到** `GITHUB_APP` / `GITHUB_TOKEN` / 任何 OAuth token 字段;`gh` CLI 不代理、不要求登录;沙箱内 git 用宿主 `~/.gitconfig`。
+7. **进程 env 与运行时内存中 grep 不到** `GITHUB_APP` / `GITHUB_TOKEN` / 任何 OAuth/云沙箱(E2B/Daytona/Modal/Runloop)token 字段;`gh` CLI 不代理、不要求登录;沙箱 = 本地 Docker 容器,git 身份经容器内挂载的 `.gitconfig-sandbox` 注入,容器内无宿主 `~/.gitconfig`、无任何 token。
 8. **交付物 = 本地分支 commit**;push/PR 永远不作为默认行为,仅用户显式要求 + 宿主凭据可用时才 push。
 9. **认证面单一 + 多用户**:本地 token 面(`hmac.compare_digest`);**不使用 GitHub/OIDC/Slack 任何登录路径**;支持多个用户同时登录,会话/线程/指令/skills/profile **按 username 隔离**;不存在第二份认证 secret。
 
@@ -561,7 +591,8 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 - [ ] `pin_single_event_loop` 在 app import 期生效且可拒绝启动(缺 `BG_JOB_ISOLATED_LOOPS` 开关时 RuntimeError)
 - [ ] **多用户登录**:`POST /auth/login` 两个不同 username 各自 200 拿各自的 `osw_session` cookie;两浏览器同时在线,A 的 `/threads` **看不到** B 的线程,B 访问 A 的 `/threads/{id}` → **404**;admin(`CONFIGURED_ADMINS`)`all=true` 可看全量
 - [ ] token 校验:token 错 → 401;auth 未配置(无 token)→ 503 fail-closed;`X-OpenSWE-User`/`token:username` 复合 bearer 在协议面同样生效
-- [ ] 沙箱 `SANDBOX_TYPE=local`,无 GitHub token 注入;commit 作者 = **线程 owner 的 git 身份**(注册表 `git_name/git_email`,未配回退宿主 `~/.gitconfig`),**不是**强制 bot 身份
+- [ ] 沙箱 `SANDBOX_TYPE=docker`:每线程一个容器(容器名含 thread_id 前缀),run 结束容器不销毁;`docker exec` 里 `git commit` 的 **commit 作者 = 线程 owner 的 git 身份**(注册表 `git_name/git_email`,未配回退宿主 gitconfig 值),**不是**强制 bot 身份;`docker inspect` 的 env/挂载里 grep 不到任何 token
+- [ ] 删线程时容器 best-effort 清理(`docker rm -f`);`docker info` 不可达时服务器启动即报 500 级错误(fail-closed)
 - [ ] 一次 `agent` run 能:改文件 → `git commit` 到 `local/<slug>` 分支 → 汇报本地分支名,**不** push、**不**建 PR
 - [ ] `/state`(单快照 + 15s 预算 + idle 缓存 + run-in-flight 删 `next`)与 `/history`(≤5 + 90s + 合并 + 退避 3×1.5s + `/state` 降级 + 30s 快照缓存)代理
 - [ ] 超大线程(≥30MB checkpoint)下:打开线程页 P95 < 10s,期间其他线程请求不被冻结 > 1s(queue-probe 的 `lag_ms` 验证)
@@ -741,15 +772,16 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 | **改** | `langgraph.json`(两图 + `webhooks.disable_loopback=false`)、`agent/api/app.py`(auth 钩子 + 路由裁剪)、`agent/prompt.py`(本地提交段)、`agent/server.py`(沙箱去 proxy + 工具列表)、`agent/dispatch.py`(source 收窄 + loopback 反转)、`agent/completion.py`(失败回执简化)、`agent/scheduler.py`(去 baby_sit/cost)、`agent/dashboard/routes.py`(auth 换 token + 端点裁剪)、`agent/dashboard/thread_api.py`(`github_login`→`local_user`、去 GitHub token 校验) |
 | **留** | `agent/webapp.py`、`agent/utils/event_loop.py`、`agent/postgres_persistence.py`、`agent/input_messages.py`、`agent/utils/sandbox.py`、`agent/integrations/local.py`、`agent/utils/sandbox_paths.py`、`agent/utils/queue_debug.py`、`agent/utils/thread_ops.py`、`agent/api/health.py`、`agent/dashboard/{thread_api,plan_api,plan_store,workflow_approval_api,schedules,skills,agent_instructions,user_instructions,options,profiles}.py`、`agent/middleware/{sanitize,tool_error,exclude_tools,model_call_limit,model_call_timeout,strip_thoughts,prepare_run,check_message_queue}.py`、`agent/tools/{web_search,fetch_url,http_request,save_plan,approve_plan,enter_plan_mode,schedule_thread_wakeup,background_execute,background_task,recreate_sandbox,sandbox_reset,report_platform_issue,read_user_settings,save_user_instructions,save_user_skill,delete_user_skill,output_iframe}.py` |
 | **改语义** | `agent/local_auth.py`(从死代码 → 接上,改为**复合 bearer 多身份**:共享 token + `X-OpenSWE-User`/`token:username`)、`agent/utils/repo.py`(仅本地仓库解析) |
-| **新增** | `agent/dashboard/auth.py`(多用户登录/登出/`/me`/`/users`)、`agent/dashboard/user_registry.py`(本地用户注册表,store `local_users`) |
-| **删** | `agent/{reviewer,analyzer,chat,baby_sit,session_cost}.py`、`agent/review/*`、`agent/graphs/{reviewer,analyzer,chat}.py`、`agent/utils/{github_app,github_checks,github_ci,github_comments,github_feedback,github_http,github_org_membership,github_proxy,github_token}.py`、`agent/middleware/{refresh_github_proxy,pr_creation_guard,workflow_push_guard,settle_review_check}.py`、`agent/webhooks/{slack,linear,github,common}.py`(留 run-complete)、`agent/dashboard/{oauth,github_token_auth,oidc_auth,slack_oauth,notion_oauth,user_mappings,review_api,review_styles,review_style_jobs,review_chat_api,pr_diff,pull_request_status,agent_usage,repo_cache,repo_snapshots,enabled_repos,team_credentials,team_settings,admin}.py`、`agent/tools/{open_pull_request,request_pr_review,manage_baby_sit,notify_automation_channel,fetch_review_diff,publish_review,add_finding,update_finding,list_findings,read_finding_outcomes,reply_to_finding_thread,resolve_finding_thread,save_review_style,list_review_findings,admin_gate,linear_*,slack_*}.py`、`agent/integrations/{daytona,modal,runloop,e2b}.py`(只留 `local.py`)、`test_github_oauth.py` |
+| **删** | `agent/{reviewer,analyzer,chat,baby_sit,session_cost}.py`、`agent/review/*`、`agent/graphs/{reviewer,analyzer,chat}.py`、`agent/utils/{github_app,github_checks,github_ci,github_comments,github_feedback,github_http,github_org_membership,github_proxy,github_token}.py`、`agent/middleware/{refresh_github_proxy,pr_creation_guard,workflow_push_guard,settle_review_check}.py`、`agent/webhooks/{slack,linear,github,common}.py`(留 run-complete)、`agent/dashboard/{oauth,github_token_auth,oidc_auth,slack_oauth,notion_oauth,user_mappings,review_api,review_styles,review_style_jobs,review_chat_api,pr_diff,pull_request_status,agent_usage,repo_cache,repo_snapshots,enabled_repos,team_credentials,team_settings,admin}.py`、`agent/tools/{open_pull_request,request_pr_review,manage_baby_sit,notify_automation_channel,fetch_review_diff,publish_review,add_finding,update_finding,list_findings,read_finding_outcomes,reply_to_finding_thread,resolve_finding_thread,save_review_style,list_review_findings,admin_gate,linear_*,slack_*}.py`、`agent/integrations/{langsmith,daytona,modal,runloop,e2b}.py`(5 种云 provider 全删;`local.py` 保留为裸开发回退)、`test_github_oauth.py` |
+| **新增** | `agent/integrations/docker.py`(本地 Docker 沙箱 provider,§4.4)、`agent/dashboard/auth.py`(多用户登录/登出/`/me`/`/users`)、`agent/dashboard/user_registry.py`(本地用户注册表,store `local_users`) |
+
 
 ---
 
 ## 17. 实现顺序建议(给 AI 编程代理)
 
 1. **锁骨架**:改 `langgraph.json` 两图 + `webhooks.disable_loopback=false`;`agent/api/app.py` 换 auth 钩子(§3 多用户)+ 裁剪路由;`agent/dashboard/auth.py` + `user_registry.py` 落地;确保空实现也能 `langgraph dev` 起 + `/health` 200 + 两个 username 能分别登录。
-2. **打通本地沙箱 + 本地提交**:`SANDBOX_TYPE=local`;`agent/server.py` 去 proxy 链;接 `LOCAL_COMMIT_SECTION` 提示;跑通一次"改文件 → commit 到 `local/<slug>`"。
+2. **打通 Docker 沙箱 + 本地提交**:新增 `agent/integrations/docker.py`(§4.4)+ `SANDBOX_FACTORIES` 加 `docker` 条目 + `SANDBOX_TYPE=docker`;`agent/server.py` 去 proxy 链;接 `LOCAL_COMMIT_SECTION` 提示;跑通一次"改文件 → 容器内 `git commit` 到 `local/<slug>`"。
 3. **接持久化与有界代理**:Postgres checkpointer/store(§7)+ `thread_api.py` 有界 state/history(§5.2)。
 4. **接完成 webhook**(§9.2)+ `scheduler` 裁剪(§4.2)。
 5. **提示词收尾**(§10)+ env 清单(§12)。
