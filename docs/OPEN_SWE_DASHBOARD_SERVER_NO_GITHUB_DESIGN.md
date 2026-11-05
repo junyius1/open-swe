@@ -14,7 +14,7 @@
 
 1. **LangGraph runtime**:提供 LangGraph SDK 协议的全部 HTTP 面(`POST /threads/{id}/runs`、`GET /threads/{id}/state`、`POST /threads/{id}/history`、SSE 流、threads CRUD/search……),并**执行注册的 graph**(agent 本体)。
 2. **Open SWE 业务 API**:通过 `langgraph.json` 的 `"http": {"app": "agent.webapp:app"}` 把 Open SWE 自己的 FastAPI app **挂进同一进程**(`/dashboard/api/*`、`/webhooks/*`、`/health`、`/debug/*`)。
-3. **持久化宿主**:checkpointer 与 store 指向 Postgres(`DATABASE_URI`);缺失则降级 InMemory。
+3. **持久化宿主(唯一)**:checkpointer 与 store **只**指向 Postgres(`DATABASE_URI`)。无 InMemory/文件/pickle 等任何备用持久化;`DATABASE_URI` 缺失或不可达 → **启动 fail-closed**(§7.1)。
 
 ```
 langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
@@ -87,7 +87,8 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 - `agent/graphs/*.py` 是 **3 行 re-export shim**(`from agent.server import get_agent, traced_agent`)。本变体只留 `agent.py`、`scheduler.py` 两个 shim;**删除** `reviewer.py`/`analyzer.py`/`chat.py` shim 及对应工厂。
 - **checkpointer TTL = 12h,删除策略,每 60min 清扫**——不活跃线程的 checkpoint 整体删除(不是截断)。
 - `webhooks.url.disable_loopback=false`:官方策略开关(CLI 启动序列化为 `LANGGRAPH_WEBHOOKS` env)。开启后**相对 URL 经进程内 loopback client 直接 POST 到本进程的同一 FastAPI app**——不走网络、不暴露端口、无 https 要求。这是本变体能用**相对** `COMPLETION_WEBHOOK_URL` 的前提(§9.1)。
-- 无 `DATABASE_URI` 时 `create_checkpointer/create_store` 降级 `InMemorySaver/InMemoryStore` 并告警(进程重启即丢状态,仅裸开发用)。
+- **Postgres 是唯一持久化,无降级**:`create_checkpointer/create_store` 删除 `InMemorySaver/InMemoryStore` 分支——`DATABASE_URI` 缺失、连接失败或 `setup()`(建表/迁移)失败时,直接抛异常使进程**启动失败**(fail-closed),绝不带内存态运行。
+- **`.langgraph_api/` pickle 文件(基础书 §7 的 inmem 默认落盘)同样禁用**:本变体持久化路径只有一条 Postgres;实现时 `langgraph dev` 必须始终带 `DATABASE_URI`(见 §12),不产生也不读取 `.langgraph_api/` 状态文件。
 
 ---
 
@@ -228,6 +229,7 @@ langgraph dev  (localhost:2024, 单 uvicorn worker, 单事件循环)
 ```
 create_app():
   lifespan: pin_single_event_loop()(二次)
+            → validate_persistence_startup()(§7.1:DATABASE_URI 已设 + 连接 + checkpointer/store setup 成功,否则抛异常拒启)
             → validate_sandbox_startup_config()(校验 SANDBOX_TYPE=docker:daemon 可达 + 镜像可解析)
             → validate_local_dev_llm_config()
             退出: close_cached_models()
@@ -416,7 +418,18 @@ create_app():
 
 ## 7. 持久化与数据模型
 
-**逐字沿用 2024 设计书 §7**(checkpoint 三表 + DeltaChannel messages 存储与读成本、`_load_blobs` 同步重活、**有界读不变式**、thread `metadata` jsonb 业务状态、store 长期记忆、`DATABASE_URI` 缺失降级)。此处只给本变体差异:
+**沿用 2024 设计书 §7**(checkpoint 三表 + DeltaChannel messages 存储与读成本、`_load_blobs` 同步重活、**有界读不变式**、thread `metadata` jsonb 业务状态、store 长期记忆),但**删除其"§7.3 降级"**:本变体 `DATABASE_URI` 缺失不降级。此处给本变体差异:
+
+### 7.1 Postgres 唯一持久化(fail-closed)
+
+- `agent/postgres_persistence.py`:**删除** `_in_memory_checkpointer()`/`_in_memory_store()` 及其 import(`InMemorySaver/InMemoryStore`)。`create_checkpointer/create_store` 在无 `_DATABASE_URI` 时 `raise RuntimeError("DATABASE_URI is required; there is no in-memory or file fallback")`,而非返回内存实现。
+- **启动校验** `validate_persistence_startup()`(新增,接入 `create_app()` lifespan,§5.1):
+  1. `DATABASE_URI` 已设(否则 RuntimeError 拒启);
+  2. 建短连接 `SELECT 1` 成功(否则 RuntimeError 拒启——**连不上 Postgres 的进程不得进入服务状态**);
+  3. checkpointer/store 的 `setup()`(建表/迁移)成功。
+  校验失败 → 异常在 lifespan 抛出,进程退出码非 0;编排层(compose/系统)负责重启或告警。
+- **进程内 state LRU 缓存(§5.2)不属于持久化**:它是读加速,重启即丢,真值在 Postgres,与本节不冲突,保留。
+- **无 `.env`/文件态**:`.langgraph_api/` 目录(基础书 inmem 默认)不得作为状态来源;代码与文档中不保留任何"文件持久化"路径。
 
 - **thread metadata 删除** `github_login`/`triggering_user_email`/`pr`/`review_check_*` 等 GitHub 字段,owner 判据改 `local_user`(§3.4)。
 - **`kind` 只会出现 `agent`**(不再有 `review_chat`/`reviewer`)。
@@ -565,7 +578,7 @@ create_app():
 
 ```
 # 持久化
-DATABASE_URI=postgres://…            # 缺失则 InMemory 降级 + 告警
+DATABASE_URI=postgres://…            # 必填:唯一持久化;缺失/不可达 → 启动 fail-closed(§7.1),无 InMemory/文件降级
 # 模型(多 provider 任选其一,make_model 解析)
 ANTHROPIC_API_KEY=…                  # 或 OPENAI_*/FIREWORKS_*/gateway
 # 完成 webhook(相对路径 → 进程内 loopback 投递,§9.2;token 必填)
@@ -604,7 +617,7 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 2. 消息只增不减(`add_messages`),思考块在**写 checkpoint 前**剥离(保 `signature`)。
 3. 所有 run 走 `create_durable_run` 契约(sync 持久化 + v2 流 + resumable + 完成 webhook)。
 4. 面向用户的 checkpoint 读必须有界(state 单快照 或 history ≤5);全量遍历只允许后台显式任务。
-5. 失败必须幂等、fail-closed(webhook token、404 归一化、auth 未配置 503)。
+5. 失败必须幂等、fail-closed(webhook token、404 归一化、auth 未配置 503、**Postgres 不可用拒启** §7.1)。
 6. checkpointer TTL 12h 删除;业务状态放 thread metadata / store,不依赖 checkpoint 长存。
 
 **本变体追加**:
@@ -616,6 +629,7 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 **最小复刻验收**:
 - [ ] `langgraph.json` 仅 `agent` + `scheduler` + `http.app` + Postgres checkpointer/store + TTL + `webhooks.disable_loopback=false` 可启动
 - [ ] `pin_single_event_loop` 在 app import 期生效且可拒绝启动(缺 `BG_JOB_ISOLATED_LOOPS` 开关时 RuntimeError)
+- [ ] **持久化唯一性**:`DATABASE_URI` 未设 → 进程启动即失败(fail-closed,无 InMemory 运行);Postgres 容器先停再启动 dashboard → 同样启动失败;代码中 grep 不到 `InMemorySaver`/`InMemoryStore` 的运行时引用
 - [ ] **多用户登录**:`POST /auth/login` 两个不同 username 各自 200 拿各自的 `osw_session` cookie;两浏览器同时在线,A 的 `/threads` **看不到** B 的线程,B 访问 A 的 `/threads/{id}` → **404**;admin(`CONFIGURED_ADMINS`)`all=true` 可看全量
 - [ ] token 校验:token 错 → 401;auth 未配置(无 token)→ 503 fail-closed;`X-OpenSWE-User`/`token:username` 复合 bearer 在协议面同样生效
 - [ ] 沙箱 `SANDBOX_TYPE=docker`:每线程一个容器(容器名含 thread_id 前缀),run 结束容器不销毁;`docker exec` 里 `git commit` 的 **commit 作者 = 线程 owner 的 git 身份**(注册表 `git_name/git_email`,未配回退宿主 gitconfig 值),**不是**强制 bot 身份;`docker inspect` 的 env/挂载里 grep 不到任何 token

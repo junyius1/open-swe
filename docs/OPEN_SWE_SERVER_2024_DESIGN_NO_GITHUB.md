@@ -82,7 +82,7 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
 
 - 删掉 `reviewer/analyzer/chat` 三行;`agent/graphs/reviewer.py`、`analyzer.py`、`chat.py` 三个 shim 文件及 `agent/reviewer.py`/`analyzer.py`/`chat.py` 工厂**整体删除**。
 - checkpointer TTL、store、`http.app` 与基础书**一致**,不动。
-- 无 `DATABASE_URI` 时仍降级 `InMemorySaver/InMemoryStore`(基础书 §7.3 不变)。
+- **Postgres 是唯一持久化,删除基础书 §7.3 的 InMemory 降级**:`create_checkpointer/create_store` 删 `InMemorySaver/InMemoryStore` 分支;`DATABASE_URI` 缺失、连接失败或 `setup()` 失败 → 抛异常使进程**启动失败**(fail-closed)。`.langgraph_api/` pickle 落盘(inmem 默认)同样不作为状态来源。
 
 ---
 
@@ -146,7 +146,7 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
 
 ## 7. 持久化与数据模型
 
-**逐字沿用基础设计书 §7**:checkpoint 三表 + DeltaChannel messages 存储与读成本、`_load_blobs` 同步重活、**有界读不变式**(state 单快照 / history ≤5)、thread `metadata` jsonb 业务状态、store 长期记忆、`DATABASE_URI` 缺失降级。
+**沿用基础设计书 §7**(checkpoint 三表 + DeltaChannel messages 存储与读成本、`_load_blobs` 同步重活、**有界读不变式** state 单快照 / history ≤5、thread `metadata` jsonb 业务状态、store 长期记忆),但**删除其 §7.3 降级**:持久化宿主**只有 Postgres**(`DATABASE_URI` 必填);缺失/不可达 → 启动校验 `validate_persistence_startup()`(§5 应用组装)直接拒启,无 InMemory、无文件/pickle 等任何备用方案。
 
 唯一改动:thread metadata 里**删除** `github_login` 相关字段,owner 判据改为 §2.3 的本地身份;`kind` 只会出现 `agent`(不再有 `review_chat`/`reviewer`/`thread_wakeup` 之外的 PR 相关 kind)。
 
@@ -181,7 +181,7 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
 ## 9. Dashboard 业务层(裁剪)
 
 ### 9.1 应用组装(保留机制)
-`create_app()`:lifespan `pin_single_event_loop()`(二次)→ `validate_sandbox_startup_config()`(此时校验 `SANDBOX_TYPE=docker`:daemon 可达 + 镜像可解析)→ `validate_local_dev_llm_config()`;退出 `close_cached_models()`。`QueueDebugMiddleware` + `enable_from_env()`(`OPEN_SWE_QUEUE_DEBUG=1`)保留。**auth 钩子换成 §2 的静态 token / 开放本地**。CORS 保留。
+`create_app()`:lifespan `pin_single_event_loop()`(二次)→ `validate_persistence_startup()`(§7:`DATABASE_URI` 已设 + 连接成功 + checkpointer/store `setup()` 成功,否则抛异常拒启)→ `validate_sandbox_startup_config()`(此时校验 `SANDBOX_TYPE=docker`:daemon 可达 + 镜像可解析)→ `validate_local_dev_llm_config()`;退出 `close_cached_models()`。`QueueDebugMiddleware` + `enable_from_env()`(`OPEN_SWE_QUEUE_DEBUG=1`)保留。**auth 钩子换成 §2 的静态 token / 开放本地**。CORS 保留。
 
 ### 9.2 路由(保留/删除)
 | 保留 | 删除 |
@@ -252,7 +252,7 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
 
 ```
 # 持久化
-DATABASE_URI=postgres://…            # 缺失则 InMemory 降级 + 告警
+DATABASE_URI=postgres://…            # 必填:唯一持久化;缺失/不可达 → 启动 fail-closed,无 InMemory/文件降级
 # 模型(多 provider 任选其一,make_model 解析)
 ANTHROPIC_API_KEY=…                  # 或 OPENAI_*/FIREWORKS_*/gateway
 # 完成 webhook(相对路径 → 进程内 loopback 投递,§8.1;token 必填)
@@ -285,6 +285,7 @@ OPEN_SWE_QUEUE_DEBUG=1
 
 **最小复刻验收(本变体)**:
 - [ ] `langgraph.json` 仅 `agent` + `scheduler` + `http.app` + Postgres checkpointer/store + TTL 可启动
+- [ ] **持久化唯一性**:`DATABASE_URI` 未设或 Postgres 不可达 → 进程启动即失败(无 InMemory 运行);代码中 grep 不到 `InMemorySaver`/`InMemoryStore` 运行时引用
 - [ ] `pin_single_event_loop` 在 import 期生效且可拒绝启动
 - [ ] `dispatch_agent_run` 六参数契约 + 完成 webhook 幂等(**无** GitHub 触发源);`disable_loopback=false` 下 run 终结经**进程内** POST 到达 `/webhooks/run-complete`(`?token=` 错误 → 401/403),全程无公网回调
 - [ ] 静态 token 认证:带 token 200 / 缺 token 401;开放本地模式仅在 `OPEN_SWE_ALLOW_ANON=1` 生效
