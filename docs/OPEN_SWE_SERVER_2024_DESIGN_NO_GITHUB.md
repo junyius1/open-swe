@@ -150,6 +150,47 @@ thread 级 owner 校验(`_assert_thread_owner/_assert_thread_readable`)**保留�
 
 唯一改动:thread metadata 里**删除** `github_login` 相关字段,owner 判据改为 §2.3 的本地身份;`kind` 只会出现 `agent`(不再有 `review_chat`/`reviewer`/`thread_wakeup` 之外的 PR 相关 kind)。
 
+### 7.1 LLM 推理消息:独立大表持久化 + 懒加载(本变体新增)
+
+**需求**:推理(reasoning/thinking)消息必须**显示**在 UI,但不能放进 checkpoint——
+它是超大线程体积的主因(`strip_thoughts.py` docstring 已量化)。方案:推理全文**另存
+Postgres 专表**,checkpoint 里继续剥离;UI 打开线程**不加载**推理,用户点开
+"Thought" 标签的 `>` 时才拉取单条。
+
+**新表 `llm_reasoning`**(建表在新增模块 `agent/reasoning_store.py` 的 `setup()`,
+随 `validate_persistence_startup()` 一并执行,§5):
+
+```sql
+CREATE TABLE IF NOT EXISTS llm_reasoning (
+  thread_id      TEXT NOT NULL,
+  message_id     TEXT NOT NULL,        -- AIMessage.id,UI 消息对象的 id,天然对齐
+  run_id         TEXT NOT NULL,
+  model          TEXT,                 -- 产生该推理的模型 id
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  content        TEXT NOT NULL,        -- 推理全文(单条可达数百 KB)
+  content_length INT  NOT NULL,        -- 预计算,列表接口不碰 TOAST
+  PRIMARY KEY (thread_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS ix_llm_reasoning_thread_time ON llm_reasoning (thread_id, created_at);
+```
+
+- **为什么专表而不是塞 checkpoint_blobs / BaseStore**:checkpoint 是 pickle 整状态
+  快照,读一条要反序列化全量 state(单事件循环重活);BaseStore 走 JSON 序列化,
+  设计存小记录。专表 + 窄 SQL(`SELECT content WHERE thread_id AND message_id`)
+  只读一行 TOAST 文本,不碰任何 Python 反序列化——"适合大数据"的关键。
+- **写入方(唯一写者)**:修改 `agent/middleware/strip_thoughts.py`(保留文件名,更新
+  docstring):model call 返回后,按现有提取逻辑(`additional_kwargs.reasoning_content`
+  + `reasoning`/`thinking` content blocks;Anthropic 带 `signature` 的 thinking 块**不**剥离、
+  也**不**入表)取出推理文本,`reasoning_store.upsert(thread_id, message.id, run_id, model, content)`
+  (`INSERT … ON CONFLICT (thread_id, message_id) DO NOTHING`,幂等),**然后**照旧剥离再写 checkpoint。
+  写入 best-effort:5s 超时 + 1 次重试,仍失败仅 warning(**推理是展示数据,不得让 run 失败**);
+  实时流不受影响(reasoning-delta 事件照常边跑边发,UI 实时渲染不变)。
+- **TTL/清理**:随 checkpoint 12h TTL 同周期(60min)清扫——`thread_id` 已不在
+  `checkpoints` 表的行整体删除;`DELETE /threads/{id}` 时**级联删**该线程全部推理行
+  (由 dashboard 删线程端点触发,见 dashboard 设计书 §5.2)。
+- **读方**:运行时**不**提供读端点;dashboard 进程用只读连接直查本表
+  (dashboard 设计书 §5.2 两个懒加载端点)——大文本读不进运行时单事件循环。
+
 ---
 
 ## 8. 完成信号
@@ -286,6 +327,7 @@ OPEN_SWE_QUEUE_DEBUG=1
 **最小复刻验收(本变体)**:
 - [ ] `langgraph.json` 仅 `agent` + `scheduler` + `http.app` + Postgres checkpointer/store + TTL 可启动
 - [ ] **持久化唯一性**:`DATABASE_URI` 未设或 Postgres 不可达 → 进程启动即失败(无 InMemory 运行);代码中 grep 不到 `InMemorySaver`/`InMemoryStore` 运行时引用
+- [ ] **推理消息**(§7.1):带推理的 run 结束后 `llm_reasoning` 有对应行;`/state` 与 `/history` 的 messages 里 grep 不到 reasoning/thinking 内容;实时流中推理仍边跑边显示;重复 upsert 不产生重复行;Postgres 写入失败时 run 不失败(仅 warning)
 - [ ] `pin_single_event_loop` 在 import 期生效且可拒绝启动
 - [ ] `dispatch_agent_run` 六参数契约 + 完成 webhook 幂等(**无** GitHub 触发源);`disable_loopback=false` 下 run 终结经**进程内** POST 到达 `/webhooks/run-complete`(`?token=` 错误 → 401/403),全程无公网回调
 - [ ] 静态 token 认证:带 token 200 / 缺 token 401;开放本地模式仅在 `OPEN_SWE_ALLOW_ANON=1` 生效
@@ -300,7 +342,8 @@ OPEN_SWE_QUEUE_DEBUG=1
 
 | 状态 | 文件 |
 |---|---|
-| 改 | `langgraph.json`(两图)、`agent/api/app.py`(auth 钩子 + 路由裁剪)、`agent/prompt.py`(本地提交段)、`agent/server.py`(沙箱去 proxy + 工具列表)、`agent/dispatch.py`(source 收窄)、`agent/completion.py`(失败回执简化)、`agent/scheduler.py`(去 baby_sit/cost) |
+| 改 | `langgraph.json`(两图)、`agent/api/app.py`(auth 钩子 + 路由裁剪)、`agent/prompt.py`(本地提交段)、`agent/server.py`(沙箱去 proxy + 工具列表)、`agent/dispatch.py`(source 收窄)、`agent/completion.py`(失败回执简化)、`agent/scheduler.py`(去 baby_sit/cost)、`agent/middleware/strip_thoughts.py`(剥离前先把推理写入 `llm_reasoning`,§7.1) |
+| 新增 | `agent/reasoning_store.py`(§7.1 `llm_reasoning` 表 DDL/upsert/TTL 清扫,唯一写者) |
 | 留 | `agent/webapp.py`、`agent/utils/event_loop.py`、`agent/postgres_persistence.py`、`agent/input_messages.py`、`agent/utils/sandbox.py`、`agent/integrations/local.py`(裸开发回退)、`agent/utils/sandbox_paths.py`、`agent/utils/queue_debug.py`、`agent/api/health.py`、`agent/dashboard/{thread_api,plan_api,plan_store,workflow_approval_api}.py`、`agent/middleware/{sanitize,tool_error,exclude_tools,model_call_limit,model_call_timeout,strip_thoughts,prepare_run}.py`、`agent/tools/{web_search,fetch_url,http_request,save_plan,approve_plan,enter_plan_mode,schedule_thread_wakeup,background_execute,background_task,recreate_sandbox,sandbox_reset,report_platform_issue,read_user_settings,save_user_instructions,save_user_skill,delete_user_skill,output_iframe,read_repo_file*,search_repo_code*}.py` |
 | 改语义 | `agent/local_auth.py`(从死代码→接上,作为认证入口)、`agent/utils/repo.py`(仅本地仓库解析) |
 | 删 | `agent/{reviewer,analyzer,chat,baby_sit,session_cost}.py`、`agent/review/*`、`agent/graphs/{reviewer,analyzer,chat}.py`、`agent/utils/{github_app,github_checks,github_ci,github_comments,github_feedback,github_http,github_org_membership,github_proxy,github_token}.py`、`agent/middleware/{refresh_github_proxy,pr_creation_guard,workflow_push_guard,settle_review_check}.py`、`agent/webhooks/{slack,linear,github,common}.py`(留 run-complete)、`agent/dashboard/{oauth,github_token_auth,oidc_auth,slack_oauth,notion_oauth,user_mappings,review_api,review_styles,review_style_jobs,review_chat_api,pr_diff,pull_request_status,agent_usage,repo_cache,repo_snapshots,enabled_repos,team_credentials,team_settings,profiles*}.py`、`agent/tools/{open_pull_request,request_pr_review,manage_baby_sit,notify_automation_channel,fetch_review_diff,publish_review,add_finding,update_finding,list_findings,read_finding_outcomes,reply_to_finding_thread,resolve_finding_thread,save_review_style,list_review_findings,admin_gate,linear_*,slack_*}.py`、`agent/integrations/{langsmith,daytona,modal,runloop,e2b}.py`(5 种云 provider 全删)、`agent/integrations/{linear,notion_mcp,langsmith_tools 的 GitHub 相关}.py`、`test_github_oauth.py` |

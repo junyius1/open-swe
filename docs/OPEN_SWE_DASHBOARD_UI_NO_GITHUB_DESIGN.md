@@ -521,6 +521,7 @@ rejectWorkflowPush` + `WorkflowPushApprovalsResponse`(**workflow-approval 端点
 `getThread`、`queueMessage`、`cancelThread`、`adminCancelThread`、`deleteThread`、
 `getThreadBranchDiff`、`getThreadWorkingTreeDiff`、`streamUrl`、`groupThreads`、
 `agentsLangGraphApiUrl`、`agentsRequest`。
+**新增**:`getThreadReasoning(threadId, messageId)`(§8.8 懒加载单条推理正文)。
 
 **类型改造**:
 ```ts
@@ -610,6 +611,51 @@ UI 无感,保留。**LLM gate 排队**:默认 `OPEN_SWE_LLM_MAX_CONCURRENCY=1` �
 未保存离开守卫)。表单字段:`name/prompt/cron/repo?(自由文本)/model_id?/effort?`。
 删除 `slack_channel_id`/`slack_notification_mode` 输入与展示。
 触发结果 `ScheduleTriggerResult` 保留(`status/schedule_id/thread_id/run_id?`)。
+
+### 8.8 推理(reasoning)消息:懒加载(本变体新增)
+
+后端契约(2024 设计书 §7.1 + dashboard 设计书 §5.2.1):推理全文**不在** checkpoint/state/
+history 里,而在 Postgres 专表 `llm_reasoning`;实时流中的推理(reasoning-delta 事件)**照常
+边跑边显示**,run 结束后历史推理需懒加载。
+
+**行为规格**:
+
+1. **打开线程不加载推理**:
+   - 历史消息渲染(`streamMessagesToUi.ts` 的 `reasoningText()` 提取)——checkpoint 里的
+     AI 消息已无 reasoning 内容,提取自然为空,`ReasoningBlock` 收到空 text。
+   - **不改** `ReasoningBlock` 的实时路径:`isLive` 期间文本从流 chunk 里来,照常流式渲染
+     (现有组件行为保留)。
+2. **空 text 的历史 reasoning chunk → 懒加载桩**:`renderItems.ts` 的 `reasoning-item`
+   分支(现 `chunk.kind === "reasoning"`)改造——
+   `reasoningText(chunk 对应 message)` 为空且消息有 `id` 时,`ReasoningBlock` 渲染
+   **可展开桩**(`> Thought`(无耗时时长,因后端未存 duration;可选存 `content_length`
+   显示"~N KB"))。展开时 **mutation/fetch** `GET /threads/{threadId}/reasoning/{messageId}`:
+   - 200 → 显示正文(白底灰字现有样式,长文 `whitespace-pre-wrap`;>100KB 时按行切
+     虚拟滚动或分片渲染——**不引入**虚拟滚动库,用"折叠前 N 行 + 展开更多"降级即可)。
+   - 404 → 显示 "无推理记录"(模型该轮未产生推理,或已被 TTL 清理)。
+   - 结果写入 TanStack Query cache(key `["reasoning", threadId, messageId]`),
+     同一消息二次展开不再请求;`staleTime: Infinity`(单条推理不可变)。
+3. **`agentsApi` 新增两个方法**(`features/agents/lib/api.ts`):
+   ```ts
+   listThreadReasoning: (threadId: string) =>
+     agentsRequest<Array<{ message_id: string; run_id: string; model?: string | null;
+                           created_at: string; content_length: number }>>(
+       `/threads/${encodeURIComponent(threadId)}/reasoning`),
+   getThreadReasoning: (threadId: string, messageId: string) =>
+     agentsRequest<{ message_id: string; content: string }>(
+       `/threads/${encodeURIComponent(threadId)}/reasoning/${encodeURIComponent(messageId)}`),
+   ```
+   (列表方法本期**可不接 UI**——逐条懒加载已够用;留着供未来"本线程全部推理"导出。
+   实现时只接 `getThreadReasoning` 即可,`listThreadReasoning` 可留可不加,以 §13 步骤为准:
+   **只加 `getThreadReasoning`**。)
+4. **404 语义**:与线程级 404 归一化一致——他人线程/不存在线程的推理请求 → 404 →
+   不报错弹窗,显示 "无推理记录" 或按导航 404 跳走(消息页内已在线程详情页,
+   走 "无推理记录" 文案)。
+5. **`ReasoningBlock` 组件改造**(现有文件 `messages/ReasoningBlock.tsx`):
+   props 扩展为 `{ text: string; isLive: boolean; lazy?: { threadId: string; messageId: string } }`
+   ——`lazy` 存在且 `text` 为空时,展开动作触发 `getThreadReasoning`(经 `useMutation` 或
+   直接 `useQuery` 按需启用);loading 显示现有 `ThinkingSpinner` 样式骨架;
+   其余(实时流、耗时标签、自动折叠)行为**不变**。
 
 ---
 
@@ -786,8 +832,11 @@ src/features/agents/lib/api.ts          §8.1(删 PR/终端/recovery,分支 diff
 src/features/agents/lib/queries.ts      §8.6(删 pullRequestStatus key)
 src/features/agents/lib/types.ts        §8.2(去 trace/sourceUrl 渲染依赖)
 src/features/agents/lib/provider/useSubmitAgentMessage.ts   §8.4(仅注释)
+src/features/agents/lib/streamMessagesToUi.ts               §8.8(历史空 reasoning chunk → 带 lazy 信息的 reasoning-item)
 src/features/agents/lib/AgentThreadStreamProvider.tsx       §8.5(注释;行为不动)
 src/features/agents/components/AgentThreadView.tsx          §9(删 PR 轮询/fixPullRequest)
+src/features/agents/components/messages/ReasoningBlock.tsx  §8.8(lazy 懒加载 props)
+src/features/agents/components/messages/renderItems.ts      §8.8(reasoning-item 空 text → lazy 桩)
 src/features/agents/components/AgentGitPanel.tsx            §9.2
 src/features/agents/components/ChangesPanel.tsx / DiffFilesView.tsx / chat/DiffView.tsx  §9.3(文案)
 src/features/agents/components/AgentsHome.tsx / AgentsSidebar.tsx / AgentsThreadsPage.tsx §8.3
@@ -807,7 +856,7 @@ src/routes/agents/$threadId_.plan.tsx, agents/automations/*, agents/skills.tsx,
 src/routes/agents/local/$sessionId.tsx
 src/lib/{api-base,dashboard-fetch,session,auth-redirect,auth-redirect-core,
          plan,hydration,query,notifications,desktop-local-mode,utils}.ts(x)
-src/features/agents/lib/{queries(部分),streamMessagesToUi,structuredInputMessages,
+src/features/agents/lib/{queries(部分),structuredInputMessages,
     messageTimestamps,summaryEvent,contextUsage,queuedMessages,diffPanelStore,
     rightPanelStore,gitPanelPreferences,sidebarFilter,sidebarPrefs,threadViews,
     toolNames,apiWarmup,useRunCompletionNotifier,agentRunStatus,desktopLocal*,
@@ -842,7 +891,8 @@ package.json / tsconfig / tailwind 配置 / vitest 配置
 6. **agents 组件改造**:§9 git 面板(分支条/两 tab/删按钮)、§8.3 侧栏与列表
    (source 枚举、`all` 开关、admin cancel)、§8.7 automations 字段、
    `AgentThreadView` 删 PR 轮询与 `fixPullRequest`;
-   settings 的 `EnvironmentsSection` 降级只读(§10.1)。
+   settings 的 `EnvironmentsSection` 降级只读(§10.1);
+   §8.8 推理懒加载(`agentsApi.getThreadReasoning` + `ReasoningBlock` lazy + `renderItems` 空 reasoning 桩)。
 7. **设置页与 admin**:`my-settings.tsx` 组装(§10.1/10.2)、`AccountSection`/
    `PreferencesSection`/`EnvironmentsSection` 改、`admin.tsx` 本地用户页(§10.4)、
    `SidebarUserMenu` 退出语义(§10.3)。**可选**:LLM gate 观测页(§10.7)。
@@ -863,6 +913,10 @@ package.json / tsconfig / tailwind 配置 / vitest 配置
       运行中再发一条 → "Queued next" 气泡,下一次 model call 前注入(后端队列语义)。
 - [ ] 停止按钮 → `/threads/{id}/cancel` → 状态 `interrupted`,composer 解锁。
 - [ ] 完成后 git 面板:显示 `local/<slug>` 分支 + 文件列表 + 单文件 diff;
+- [ ] **推理懒加载(§8.8)**:运行中带推理的模型 → 实时流里推理边跑边显示;run 结束后刷新页面,
+      历史消息只见 "> Thought" 桩、**不**发起推理正文请求;点 `>` 展开 → 网络面板出现一次
+      `GET /threads/{id}/reasoning/{messageId}` 并渲染正文;二次展开无新请求;
+      无推理的 AI 消息点 `>` → "无推理记录"(404 不弹错)。
       工作树 tab 显示未提交改动;无 PR 徽章、无 CI 状态、无 "Open PR"。
 - [ ] plan mode:`/plan` 命令 → 计划页审批(approve/reject/评论)→ 审批后发 run 继续。
 - [ ] automations:建 cron 任务、手动 trigger 生成线程。
@@ -923,6 +977,7 @@ ui/src 下(大小写不敏感):
 | `POST /threads/{id}/stream/events`、`GET /threads/{id}/stream` | §5.2 SSE(60s idle / 14400s lifetime) | SDK 流;UI 不自设短超时 |
 | `GET /threads/{id}/state`、`POST /threads/{id}/history` | §5.2 有界代理(90s/15s/30s、clamp≤5、退避 3×1.5s、30s 快照缓存) | SDK `getState`/hydrate;UI 透传 503 文案 |
 | `GET /threads/{id}/working-tree-diff`、`/branch-diff` | 保留端点 | git 面板(§9) |
+| `GET /threads/{id}/reasoning`、`GET /threads/{id}/reasoning/{message_id}` | dashboard 设计书 §5.2.1(表见 2024 设计书 §7.1) | 推理懒加载(§8.8,本期只接单条) |
 | `POST /threads/{id}/cancel`、`POST /admin/threads/{id}/cancel` | §5.2 / §3.4 | 停止/admin 停止 |
 | `GET/POST /schedules`、`PATCH/DELETE /schedules/{id}`、`POST /schedules/{id}/trigger` | §5.5 | automations |
 | `GET /plan/{thread_id}` 等 7 端点 | §5.3 | 计划审批页 |

@@ -258,7 +258,7 @@ create_app():
 | `GET /threads/sidebar` | 📖 侧栏精简列表(active/resolved 两段) | **200** payload + `Server-Timing` 头 | 401 |
 | `GET /threads/page` | 📖 分页列表(过滤+排序) | query `limit(≤100,默认25)/offset/all?(admin)/resolved?/viewed?/source?/status?/q?/scope=all\|interactive\|automation/sort_by=updated_at\|created_at` → **200** `{"items":[…],"limit","offset","hasMore":bool}`;无结果 = 200 空 items;**底层 `POST /threads/search` 的 metadata 过滤必须含 `local_user == sub`**(`all=true` 且 admin 时去掉) | 400 参数非法 |
 | `GET /threads/{id}` | 📖 **线程详情元数据**(*transcript 不在这里*——前端另调 `/state` hydrate);`mark_viewed=true` 默认置已读 | **200** ThreadListItem 全字段 | **404 归一化**(不存在或非本身份) |
-| `DELETE /threads/{id}` | 🗑️ **删线程** + 其 checkpoint/流(不可恢复) | **204** | 404 |
+| `DELETE /threads/{id}` | 🗑️ **删线程** + 其 checkpoint/流 + **`llm_reasoning` 该线程全部行**(§5.2.1,`DELETE FROM llm_reasoning WHERE thread_id=$1`,不可恢复) | **204** | 404 |
 | `POST /threads/{id}/resolve` | ✅ **标记已解决/未解决**(列表分组) | body `{"resolved": bool}` → **200** 更新后列表项 | 404 |
 | `POST /threads/{id}/cancel` | 🛑 **取消线程全部活动 run**(`cancel_many(action="interrupt")`) | **200** 列表项;`latest_run_status="interrupted"` | 404;502 运行时不可达 |
 | `POST /threads/{id}/runs/{run_id}/cancel` | 🛑 取消指定 run | **200** 透传 | 404;run 已终态 → 400/409 |
@@ -325,6 +325,23 @@ create_app():
 
 - 退避耗尽仍败 → **503** `{"detail":"thread history request timed out; retry"}`。
 - **已知边界**:客户端超时/放弃**不取消**服务端已入队的遍历;被放弃的遍历仍占唯一事件循环,后续请求(含 fallback)排在其后——所以"有界 + 合并 + 退避"是三层防御。
+
+**推理(reasoning)懒加载端点(§5.2.1)**
+
+推理全文由运行时写入 Postgres 专表 `llm_reasoning`(表结构/写入/TTL 见 2024 设计书 §7.1);
+**`/state`、`/history`、SSE 均不含历史推理**(checkpoint 里已被剥离)——打开线程不加载推理,
+UI 点 "Thought" 的 `>` 才调下面两个端点。dashboard 进程用**只读短连接**直查本表(不代理运行时,
+不进单事件循环;连接池复用 `postgres_persistence` 的同一 `DATABASE_URI` 配置,但独立小池 min=1/max=2):
+
+| 端点 | 功能 | 成功 | 失败定义 |
+|---|---|---|---|
+| `GET /threads/{id}/reasoning` | 📖 该线程推理**清单**(不含正文) | **200** `[{"message_id","run_id","model"?,"created_at","content_length"}]`(按 created_at 升序,limit 1000) | 404 线程不存在/非本身份(与 `/threads/{id}` 同判,§3.4) |
+| `GET /threads/{id}/reasoning/{message_id}` | 📖 **单条**推理正文 | **200** `{"message_id","content"}` | 404 线程或该 message_id 无推理(无推理的 AI 消息点 `>` 也走此路径 → 404,UI 显示"无推理记录") |
+
+- 归属校验:先 `threads.get(thread_id)` 判存在 + `local_user`(admin 例外),再查表——
+  不得凭 message_id 直接查表(防跨用户枚举)。
+- 单条正文上限:实现时 `LIMIT 1` 直读;`content_length > 10MB` 的行不应存在
+  (run 级 model_call_limit 保证),若存在仍原样返回(前端分页渲染,见 UI 设计书 §8.9)。
 
 **SSE 流代理**
 
@@ -636,6 +653,7 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 - [ ] 删线程时容器 best-effort 清理(`docker rm -f`);`docker info` 不可达时服务器启动即报 500 级错误(fail-closed)
 - [ ] 一次 `agent` run 能:改文件 → `git commit` 到 `local/<slug>` 分支 → 汇报本地分支名,**不** push、**不**建 PR
 - [ ] `/state`(单快照 + 15s 预算 + idle 缓存 + run-in-flight 删 `next`)与 `/history`(≤5 + 90s + 合并 + 退避 3×1.5s + `/state` 降级 + 30s 快照缓存)代理
+- [ ] **推理懒加载**(§5.2.1):`GET /threads/{id}/reasoning` 只返回清单无正文;`GET /threads/{id}/reasoning/{message_id}` 返回正文;B 用户查 A 的线程推理 → **404**;删线程后 `llm_reasoning` 无该线程残留行
 - [ ] 超大线程(≥30MB checkpoint)下:打开线程页 P95 < 10s,期间其他线程请求不被冻结 > 1s(queue-probe 的 `lag_ms` 验证)
 - [ ] run 终结经**进程内** POST 到达 `/webhooks/run-complete`(`?token=` 错误 → 401);全程无公网回调
 - [ ] SSE 流:客户端断开 → 上游订阅被释放(不泄漏事件循环);晚连接带 `Last-Event-ID` 重放
@@ -810,11 +828,11 @@ DASHBOARD_STATE_CACHE_MAX_ENTRIES=256
 
 | 状态 | 文件 |
 |---|---|
-| **改** | `langgraph.json`(两图 + `webhooks.disable_loopback=false`)、`agent/api/app.py`(auth 钩子 + 路由裁剪)、`agent/prompt.py`(本地提交段)、`agent/server.py`(沙箱去 proxy + 工具列表)、`agent/dispatch.py`(source 收窄 + loopback 反转)、`agent/completion.py`(失败回执简化)、`agent/scheduler.py`(去 baby_sit/cost)、`agent/dashboard/routes.py`(auth 换 token + 端点裁剪)、`agent/dashboard/thread_api.py`(`github_login`→`local_user`、去 GitHub token 校验) |
+| **改** | `langgraph.json`(两图 + `webhooks.disable_loopback=false`)、`agent/api/app.py`(auth 钩子 + 路由裁剪)、`agent/prompt.py`(本地提交段)、`agent/server.py`(沙箱去 proxy + 工具列表)、`agent/dispatch.py`(source 收窄 + loopback 反转)、`agent/completion.py`(失败回执简化)、`agent/scheduler.py`(去 baby_sit/cost)、`agent/dashboard/routes.py`(auth 换 token + 端点裁剪)、`agent/dashboard/thread_api.py`(`github_login`→`local_user`、去 GitHub token 校验、§5.2.1 推理懒加载两端点 + 删线程级联) |
 | **留** | `agent/webapp.py`、`agent/utils/event_loop.py`、`agent/postgres_persistence.py`、`agent/input_messages.py`、`agent/utils/sandbox.py`、`agent/integrations/local.py`、`agent/utils/sandbox_paths.py`、`agent/utils/queue_debug.py`、`agent/utils/thread_ops.py`、`agent/api/health.py`、`agent/dashboard/{thread_api,plan_api,plan_store,workflow_approval_api,schedules,skills,agent_instructions,user_instructions,options,profiles}.py`、`agent/middleware/{sanitize,tool_error,exclude_tools,model_call_limit,model_call_timeout,strip_thoughts,prepare_run,check_message_queue}.py`、`agent/tools/{web_search,fetch_url,http_request,save_plan,approve_plan,enter_plan_mode,schedule_thread_wakeup,background_execute,background_task,recreate_sandbox,sandbox_reset,report_platform_issue,read_user_settings,save_user_instructions,save_user_skill,delete_user_skill,output_iframe}.py` |
 | **改语义** | `agent/local_auth.py`(从死代码 → 接上,改为**复合 bearer 多身份**:共享 token + `X-OpenSWE-User`/`token:username`)、`agent/utils/repo.py`(仅本地仓库解析) |
 | **删** | `agent/{reviewer,analyzer,chat,baby_sit,session_cost}.py`、`agent/review/*`、`agent/graphs/{reviewer,analyzer,chat}.py`、`agent/utils/{github_app,github_checks,github_ci,github_comments,github_feedback,github_http,github_org_membership,github_proxy,github_token}.py`、`agent/middleware/{refresh_github_proxy,pr_creation_guard,workflow_push_guard,settle_review_check}.py`、`agent/webhooks/{slack,linear,github,common}.py`(留 run-complete)、`agent/dashboard/{oauth,github_token_auth,oidc_auth,slack_oauth,notion_oauth,user_mappings,review_api,review_styles,review_style_jobs,review_chat_api,pr_diff,pull_request_status,agent_usage,repo_cache,repo_snapshots,enabled_repos,team_credentials,team_settings,admin}.py`、`agent/tools/{open_pull_request,request_pr_review,manage_baby_sit,notify_automation_channel,fetch_review_diff,publish_review,add_finding,update_finding,list_findings,read_finding_outcomes,reply_to_finding_thread,resolve_finding_thread,save_review_style,list_review_findings,admin_gate,linear_*,slack_*}.py`、`agent/integrations/{langsmith,daytona,modal,runloop,e2b}.py`(5 种云 provider 全删;`local.py` 保留为裸开发回退)、`test_github_oauth.py` |
-| **新增** | `agent/integrations/docker.py`(本地 Docker 沙箱 provider,§4.4)、`agent/dashboard/auth.py`(多用户登录/登出/`/me`/`/users`)、`agent/dashboard/user_registry.py`(本地用户注册表,store `local_users`)、`agent/utils/llm_gate.py` + `LLMGateMiddleware`(LLM 并发 gate,§9.5) |
+| **新增** | `agent/integrations/docker.py`(本地 Docker 沙箱 provider,§4.4)、`agent/dashboard/auth.py`(多用户登录/登出/`/me`/`/users`)、`agent/dashboard/user_registry.py`(本地用户注册表,store `local_users`)、`agent/utils/llm_gate.py` + `LLMGateMiddleware`(LLM 并发 gate,§9.5)。(`llm_reasoning` 表的写者在运行时 `agent/reasoning_store.py`,见 2024 设计书 §7.1;dashboard 侧只读,不新增后端文件) |
 
 
 ---
