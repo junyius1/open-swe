@@ -222,3 +222,69 @@ async def test_make_model_local_model_is_marked() -> None:
     assert marker_seen.get("model") == "/mnt/D/models/Qwen3.8-27B"
     assert getattr(lo_base, "_open_swe_reasoning_patched", False)
     assert model_utils._local_reasoning_installed
+
+
+def test_reasoning_stream_switch_reads_env() -> None:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.delenv("LOCAL_LLM_STREAM_REASONING", raising=False)
+        assert model_utils.local_reasoning_stream_enabled() is True
+        monkeypatch.setenv("LOCAL_LLM_STREAM_REASONING", "true")
+        assert model_utils.local_reasoning_stream_enabled() is True
+        monkeypatch.setenv("LOCAL_LLM_STREAM_REASONING", "1")
+        assert model_utils.local_reasoning_stream_enabled() is True
+        monkeypatch.setenv("LOCAL_LLM_STREAM_REASONING", "false")
+        assert model_utils.local_reasoning_stream_enabled() is False
+        monkeypatch.setenv("LOCAL_LLM_STREAM_REASONING", "0")
+        assert model_utils.local_reasoning_stream_enabled() is False
+        monkeypatch.setenv("LOCAL_LLM_STREAM_REASONING", "Off")
+        assert model_utils.local_reasoning_stream_enabled() is False
+
+
+async def test_make_model_stream_off_thinks_without_streaming() -> None:
+    """LOCAL_LLM_STREAM_REASONING=false: model still thinks (enable_thinking
+    stays on) but is not marked, so no reasoning capture/stream events."""
+    _install_fresh()
+
+    class _RealInstance:
+        """Plain object (no attribute auto-creation) so an absent marker is
+        observable, unlike a MagicMock whose getattr always succeeds."""
+
+    seen: dict[str, Any] = {}
+
+    def _spy_init(model: str, **kwargs: Any) -> Any:
+        instance = _RealInstance()
+        seen["model"] = model
+        seen["marked"] = getattr(instance, model_utils._LOCAL_REASONING_MARKER, None)
+        seen["extra_body"] = kwargs.get("extra_body")
+        return instance
+
+    install_calls = 0
+    original_install = model_utils.install_local_reasoning_patch
+
+    def _spy_install() -> None:
+        nonlocal install_calls
+        install_calls += 1
+        original_install()
+
+    original_init = model_utils.init_chat_model
+    original_installed_flag = model_utils._local_reasoning_installed
+    model_utils._local_reasoning_installed = False
+    model_utils.init_chat_model = _spy_init
+    model_utils.install_local_reasoning_patch = _spy_install
+    try:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.delenv("LOCAL_LLM_ENABLE_THINKING", raising=False)
+            monkeypatch.setenv("LOCAL_LLM_STREAM_REASONING", "false")
+            await model_utils.make_model("local:/mnt/D/models/Qwen3.8-27B", use_gateway=False)
+        assert seen["marked"] is None
+        assert install_calls == 0
+        assert model_utils._local_reasoning_installed is False
+    finally:
+        model_utils.init_chat_model = original_init
+        model_utils.install_local_reasoning_patch = original_install
+        model_utils._local_reasoning_installed = original_installed_flag
+    # thinking must stay enabled: only the streaming/capture side is off
+    assert seen["extra_body"] == {
+        "enable_thinking": True,
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
