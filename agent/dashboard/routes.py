@@ -1591,6 +1591,7 @@ async def api_review_chat_stream_events(
         thread_id,
         body,
         content_type=request.headers.get("content-type", "application/json"),
+        receive=request.receive,
     )
     return StreamingResponse(
         stream,
@@ -2320,6 +2321,7 @@ async def api_thread_stream_events(
         body,
         email=session.get("email"),
         content_type=request.headers.get("content-type", "application/json"),
+        receive=request.receive,
     )
     return StreamingResponse(
         stream,

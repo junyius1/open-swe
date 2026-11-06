@@ -51,6 +51,7 @@ from .middleware import (
     SanitizeOpenAIResponsesMiddleware,
     SanitizeThinkingBlocksMiddleware,
     SanitizeToolInputsMiddleware,
+    StripThoughtsMiddleware,
     ToolErrorMiddleware,
 )
 from .middleware.prepare_run import PrepareRunState
@@ -96,6 +97,7 @@ def _chat_general_purpose_subagent() -> SubAgent:
             [
                 FilesystemMiddleware(tools=["read_file", "ls", "glob", "grep"]),
                 SanitizeOpenAIResponsesMiddleware(),
+                StripThoughtsMiddleware(),
                 ModelCallTimeoutMiddleware(),
             ],
         ),
@@ -147,9 +149,9 @@ async def _cached_team_chat_model() -> tuple[str, str]:
     )
 
 
-def _make_model_or_defer(model_id: str, *, use_gateway: bool, **kwargs: Any) -> BaseChatModel:
+async def _make_model_or_defer(model_id: str, *, use_gateway: bool, **kwargs: Any) -> BaseChatModel:
     try:
-        return make_model(model_id, use_gateway=use_gateway, **kwargs)
+        return await make_model(model_id, use_gateway=use_gateway, **kwargs)
     except Exception as e:  # noqa: BLE001
         logger.warning("Deferring chat model setup failure for %s", model_id, exc_info=True)
         return make_deferred_error_model(e, model_id=model_id)
@@ -236,7 +238,7 @@ async def get_chat_agent(config: RunnableConfig) -> Pregel:
     )
 
     return create_deep_agent(
-        model=_make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs),
+        model=await _make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs),
         system_prompt="",
         tools=[
             read_repo_file,
@@ -257,6 +259,7 @@ async def get_chat_agent(config: RunnableConfig) -> Pregel:
                 SanitizeFireworksMessagesMiddleware(),
                 SanitizeOpenAIResponsesMiddleware(),
                 SanitizeThinkingBlocksMiddleware(),
+                StripThoughtsMiddleware(),
                 ModelCallTimeoutMiddleware(),
             ],
         ),

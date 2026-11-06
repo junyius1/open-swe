@@ -8,6 +8,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _DASHBOARD_THREAD_TTFT: Any | None = None
+_TTFT_METRICS_IMPORT_FAILED = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,16 +126,27 @@ class AssistantTextEventDetector:
 
 
 def _record_ttft_histogram(duration_seconds: float) -> None:
-    from langgraph_api.metrics_datadog import (  # pyright: ignore[reportMissingImports]
-        METRIC_TIER_INFO,
-        def_latency,
-        get_datadog_metrics_reporter,
-    )
-
-    global _DASHBOARD_THREAD_TTFT
+    global _DASHBOARD_THREAD_TTFT, _TTFT_METRICS_IMPORT_FAILED
+    if _TTFT_METRICS_IMPORT_FAILED:
+        return
+    try:
+        from langgraph_api.metrics_otlp import (
+            METRIC_TIER_INFO,
+            def_latency,
+            get_otlp_metrics_reporter,
+        )
+    except Exception:
+        # ``langgraph_api.metrics_otlp`` imports ``langgraph_api.config``,
+        # which hard-requires platform infra vars (``REDIS_URI``). A
+        # self-hosted / local dashboard does not have them and has nowhere
+        # to export the histogram anyway, so drop the metric once instead of
+        # re-importing (and warning) on every first-token observation.
+        _TTFT_METRICS_IMPORT_FAILED = True
+        logger.warning("Dashboard TTFT histogram disabled: langgraph_api metrics unavailable")
+        return
     if _DASHBOARD_THREAD_TTFT is None:
         _DASHBOARD_THREAD_TTFT = def_latency("open_swe_dashboard_thread_ttft", METRIC_TIER_INFO)
-    get_datadog_metrics_reporter().record_latency(
+    get_otlp_metrics_reporter().record_latency(
         _DASHBOARD_THREAD_TTFT,
         duration_seconds,
         attributes={"source": "dashboard"},

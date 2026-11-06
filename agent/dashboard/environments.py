@@ -27,7 +27,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any, Literal, TypedDict
 
-from langgraph_sdk import get_client
+from ..utils.thread_ops import langgraph_client
 from pydantic import BaseModel, Field, JsonValue, field_validator
 
 from .review_styles import normalize_repo_full_name
@@ -277,7 +277,7 @@ class EnvironmentUpdate(BaseModel):
 
 
 def _client():
-    return get_client()
+    return langgraph_client()
 
 
 def _now_iso() -> str:

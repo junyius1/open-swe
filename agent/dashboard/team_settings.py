@@ -11,7 +11,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from langgraph_sdk import get_client
+from ..utils.thread_ops import langgraph_client
 from pydantic import BaseModel, field_validator, model_validator
 
 from ..utils.gateway import resolve_gateway_enabled
@@ -34,7 +34,8 @@ TEAM_SETTINGS_KEY = "default"
 # prompt. Generous enough for a detailed policy, small enough to stay bounded.
 ORG_GUIDELINES_MAX_CHARS = 10_000
 REVIEW_TRACING_PROJECT_MAX_CHARS = 256
-DEFAULT_THREAD_TITLE_MODEL = "openai:gpt-5.6-luna"
+# DEFAULT_THREAD_TITLE_MODEL = "openai:gpt-5.6-luna"
+DEFAULT_THREAD_TITLE_MODEL = "local:/mnt/D/models/Qwen3.8-27B"
 DEFAULT_THREAD_TITLE_REASONING_EFFORT = "low"
 DEFAULT_TRANSCRIPTION_MODEL = "gpt-transcribe"
 TRANSCRIPTION_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
@@ -253,7 +254,7 @@ def normalize_team_settings_for_response(settings: dict[str, Any]) -> dict[str, 
 
 
 def _client():
-    return get_client()
+    return langgraph_client()
 
 
 def _env_default_repo() -> str | None:

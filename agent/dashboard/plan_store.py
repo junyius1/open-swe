@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from langgraph_sdk import get_client
+from ..utils.thread_ops import langgraph_client
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ def plan_file_path_for_thread(thread_id: str) -> str:
 
 
 def _client() -> Any:
-    return get_client()
+    return langgraph_client()
 
 
 def _item_value(item: Any) -> dict[str, Any] | None:

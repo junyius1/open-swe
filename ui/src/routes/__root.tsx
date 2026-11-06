@@ -60,9 +60,9 @@ function RootDocument({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
-        <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+        <script suppressHydrationWarning={true} dangerouslySetInnerHTML={{ __html: themeInitScript }} />
         {warmupScript && (
-          <script dangerouslySetInnerHTML={{ __html: warmupScript }} />
+          <script suppressHydrationWarning={true} dangerouslySetInnerHTML={{ __html: warmupScript }} />
         )}
         <HeadContent />
       </head>

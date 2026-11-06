@@ -330,10 +330,10 @@ def _capture_init_chat_model() -> tuple[dict[str, Any], Any]:
     return captured, _fake
 
 
-def test_make_model_direct_openai_uses_responses_websocket() -> None:
+async def test_make_model_direct_openai_uses_responses_websocket() -> None:
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model("openai:gpt-5.6-sol", use_gateway=False)
+        await model.make_model("openai:gpt-5.6-sol", use_gateway=False)
     assert captured["base_url"] == model.OPENAI_RESPONSES_WS_BASE_URL
     assert captured["use_responses_api"] is True
     assert captured["store"] is False
@@ -341,44 +341,44 @@ def test_make_model_direct_openai_uses_responses_websocket() -> None:
     assert captured["output_version"] == "responses/v1"
 
 
-def test_make_model_openai_honors_configured_base_url(
+async def test_make_model_openai_honors_configured_base_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.smith.langchain.com/openai/v1")
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model("openai:gpt-5.6-sol", use_gateway=False)
+        await model.make_model("openai:gpt-5.6-sol", use_gateway=False)
     assert captured["base_url"] == "https://gateway.smith.langchain.com/openai/v1"
 
 
-def test_make_model_openai_falls_back_to_legacy_api_base(
+async def test_make_model_openai_falls_back_to_legacy_api_base(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENAI_API_BASE", "https://openai-proxy.example/v1")
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model("openai:gpt-5.6-sol", use_gateway=False)
+        await model.make_model("openai:gpt-5.6-sol", use_gateway=False)
     assert captured["base_url"] == "https://openai-proxy.example/v1"
 
 
-def test_make_model_openai_base_url_precedes_legacy_api_base(
+async def test_make_model_openai_base_url_precedes_legacy_api_base(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", "https://primary-proxy.example/v1")
     monkeypatch.setenv("OPENAI_API_BASE", "https://legacy-proxy.example/v1")
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model("openai:gpt-5.6-sol", use_gateway=False)
+        await model.make_model("openai:gpt-5.6-sol", use_gateway=False)
     assert captured["base_url"] == "https://primary-proxy.example/v1"
 
 
-def test_make_model_gateway_openai_replaces_websocket(
+async def test_make_model_gateway_openai_replaces_websocket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key")
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model("openai:gpt-5.6-sol", use_gateway=True)
+        await model.make_model("openai:gpt-5.6-sol", use_gateway=True)
     assert captured["base_url"] == "https://gateway.smith.langchain.com/openai/v1"
     assert captured["use_responses_api"] is True
     assert captured["store"] is False
@@ -387,14 +387,14 @@ def test_make_model_gateway_openai_replaces_websocket(
     assert captured["api_key"] == "ls-key"
 
 
-def test_make_model_gateway_openai_chat_completions_optout_converts_reasoning(
+async def test_make_model_gateway_openai_chat_completions_optout_converts_reasoning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key")
     monkeypatch.setenv("LANGSMITH_GATEWAY_OPENAI_USE_RESPONSES", "false")
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model(
+        await model.make_model(
             "openai:gpt-5.6-sol",
             use_gateway=True,
             reasoning=cast(OpenAIReasoning, {"effort": "high", "summary": "auto"}),
@@ -406,13 +406,13 @@ def test_make_model_gateway_openai_chat_completions_optout_converts_reasoning(
     assert "store" not in captured
 
 
-def test_make_model_gateway_openai_preserves_reasoning_none(
+async def test_make_model_gateway_openai_preserves_reasoning_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key")
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model(
+        await model.make_model(
             "openai:gpt-5.6-sol",
             use_gateway=True,
             reasoning={"effort": "none"},
@@ -424,14 +424,14 @@ def test_make_model_gateway_openai_preserves_reasoning_none(
     assert "reasoning_effort" not in captured
 
 
-def test_make_model_gateway_openai_responses_keeps_reasoning(
+async def test_make_model_gateway_openai_responses_keeps_reasoning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key")
     reasoning = cast(OpenAIReasoning, {"effort": "high", "summary": "auto"})
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model("openai:gpt-5.6-sol", use_gateway=True, reasoning=reasoning)
+        await model.make_model("openai:gpt-5.6-sol", use_gateway=True, reasoning=reasoning)
     assert captured["use_responses_api"] is True
     assert captured["store"] is False
     assert captured["include"] == ["reasoning.encrypted_content"]
@@ -439,31 +439,31 @@ def test_make_model_gateway_openai_responses_keeps_reasoning(
     assert "reasoning_effort" not in captured
 
 
-def test_make_model_gateway_follows_env_default(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_make_model_gateway_follows_env_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key")
     monkeypatch.setenv("LANGSMITH_GATEWAY_ENABLED", "true")
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model("anthropic:claude-opus-5")  # use_gateway=None -> env default
+        await model.make_model("anthropic:claude-opus-5")  # use_gateway=None -> env default
     assert captured["base_url"] == "https://gateway.smith.langchain.com/anthropic"
     assert captured["api_key"] == "ls-key"
 
 
-def test_make_model_gateway_google_genai(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_make_model_gateway_google_genai(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key")
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model("google_genai:gemini-3.7-flash", use_gateway=True)
+        await model.make_model("google_genai:gemini-3.7-flash", use_gateway=True)
     assert captured["base_url"] == "https://gateway.smith.langchain.com/gemini"
     assert captured["api_key"] == "ls-key"
 
 
-def test_make_model_gateway_without_key_falls_back_direct(
+async def test_make_model_gateway_without_key_falls_back_direct(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured, fake = _capture_init_chat_model()
     with patch.object(model, "init_chat_model", fake):
-        model.make_model("openai:gpt-5.6-sol", use_gateway=True)  # no LangSmith key
+        await model.make_model("openai:gpt-5.6-sol", use_gateway=True)  # no LangSmith key
     # No key -> overrides skipped -> the direct-provider websocket base stands.
     assert captured["base_url"] == model.OPENAI_RESPONSES_WS_BASE_URL
     assert captured["use_responses_api"] is True

@@ -231,4 +231,23 @@ describe("streamMessagesToUi", () => {
       tool?.kind === "tool-execution" ? tool.display : undefined
     ).toBeUndefined()
   })
+
+  it("drops summarization-middleware compaction summaries from the transcript", () => {
+    const messages = streamMessagesToUi([
+      new HumanMessage({ id: "user-1", content: "Do the thing" }),
+      new HumanMessage({
+        id: "summary",
+        content:
+          "You are in the middle of a conversation that has been summarized.",
+        additional_kwargs: { lc_source: "summarization" },
+      }),
+      new AIMessage({ id: "ai-1", content: "Done." }),
+    ])
+
+    expect(messages).toHaveLength(2)
+    expect(messages.map((message) => message.author)).toEqual([
+      "user",
+      "agent",
+    ])
+  })
 })

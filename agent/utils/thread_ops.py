@@ -29,15 +29,40 @@ def langgraph_client():
 
 
 async def get_thread_active_status(thread_id: str) -> bool | None:
-    """Return whether the thread is active, or None when status cannot be determined."""
+    """Return whether the thread is active, or None when status cannot be determined.
+
+    A thread is active only when its status is ``busy`` AND it has a live
+    ``pending``/``running`` run. The denormalized ``busy`` flag can go stale
+    when a running run is cancelled/killed without the worker recomputing the
+    thread status (e.g. dev-server restart): the thread stays ``busy`` with zero
+    live runs, so the dashboard would queue every message into a store queue
+    that nothing ever drains. Reporting such a "zombie" thread as inactive lets
+    the client start a fresh run, which recomputes (self-heals) the status flag.
+    """
+    client = langgraph_client()
     try:
-        thread = await langgraph_client().threads.get(thread_id)
-        status = thread.get("status", "idle") if isinstance(thread, dict) else "idle"
-        logger.info("Thread %s status check: status=%s", thread_id, status)
-        return status == "busy"
+        thread = await client.threads.get(thread_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to get thread status for %s: %s", thread_id, exc)
         return None
+    status = thread.get("status", "idle") if isinstance(thread, dict) else "idle"
+    logger.info("Thread %s status check: status=%s", thread_id, status)
+    if status != "busy":
+        return False
+    try:
+        for run_status in ("pending", "running"):
+            if await client.runs.list(thread_id, status=run_status, limit=1):
+                return True
+        return False
+    except Exception as exc:  # noqa: BLE001
+        # Uncertain whether a live run exists: treat as active so we don't
+        # double-start a run on a thread that may already be in flight.
+        logger.warning(
+            "Failed to list runs for busy thread %s: %s; treating as active",
+            thread_id,
+            exc,
+        )
+        return True
 
 
 async def queue_message_for_thread(

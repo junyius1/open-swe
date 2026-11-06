@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import httpx
-from langgraph_sdk import get_client
+from ..utils.thread_ops import langgraph_client
 
 from ..utils.json_types import as_json_object, thread_metadata
 
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def _client():
-    return get_client()
+    return langgraph_client()
 
 
 def _now_ms() -> int:
