@@ -289,6 +289,32 @@ CREATE INDEX IF NOT EXISTS ix_llm_reasoning_thread_time ON llm_reasoning (thread
 
 ---
 
+## 10.6 推理流开关(是否从 LLM 拉取并显示 reasoning)
+
+**需求**:本地 LLM(Qwen 等 `local:` 模型)的思考(reasoning)流,要能**整体开关**——既控制**是否从 LLM 拉取**(让不让模型生成思考),也控制**是否显示/推送**到 UI。默认开启(与现状一致),用户可按需关闭以省 token、降延迟、减小流事件量。
+
+**一个开关、管两半**(实现落点 `agent/utils/model.py` 的 `local:` 分支,单一事实源):
+
+| 档位 | 从 LLM 拉取(生成思考) | 显示 / 推送 `reasoning-delta` |
+|---|---|---|
+| **Inherit**(缺省) | 跟 `LOCAL_LLM_ENABLE_THINKING` | 跟 `LOCAL_LLM_ENABLE_THINKING` |
+| **On** | 强制 `extra_body.enable_thinking = true` | 实例打 `_open_swe_local_reasoning` 标记 → reasoning patch 捕获并发流事件 |
+| **Off** | `extra_body.enable_thinking = false`(模型不产思考) | **不**打标记 → 不捕获、不发流事件(UI 只见正文 + 工具调用) |
+
+- **为什么两半必须一起控**:只关"显示"不关"拉取"会白烧思考 token;只关"拉取"不关"捕获"则历史/持久化逻辑与流行为不一致。一个布尔值同时决定 `enable_thinking` 请求字段(拉取)与实例标记(显示/推送),避免两者脱节。
+- **取值来源(优先级)**:线程属主 profile 的 `reasoning_stream`(`GET/PUT /profile`,§9;`true`/`false` 权威)**>** `LOCAL_LLM_ENABLE_THINKING` 部署默认(缺省 `true`)。profile 未设该字段 = `null` = Inherit(旧 profile 行为不变)。
+- **接线**:`get_agent()`(`agent/server.py`)按线程属主 profile 解析一次 `reasoning_stream`,透传给主模型 / 子代理 / 标题 / fallback 四个 `make_model` 构建点(与 `use_gateway` 同一透传模式)。**仅 `local:` 模型生效**,其它 provider 不受影响。
+- **与 §7.1 的关系(不冲突)**:§7.1 是**持久化/懒加载**(把已生成的思考全文另存 `llm_reasoning` 表、UI 点开才拉);本节是**源头开关**(要不要生成、要不要流式显示)。开关 Off 时既无流式 `reasoning-delta`,也无 `llm_reasoning` 新行(没有思考可存);开关 On/Inherit 时两者照常。`strip_thoughts.py` 的 checkpoint 剥离逻辑**不受开关影响**(始终剥离)。
+- **注意**:`provider_model_kwargs()` 里原有的 `local:` `enable_thinking` 注入**删除**,改由本开关统一处理(否则两处各写一次会互相覆盖)。
+
+**验收**:
+- [ ] profile `reasoning_stream=false` 的 run:`extra_body.enable_thinking == false`,model 实例**无** `_open_swe_local_reasoning` 标记,流中无 `reasoning-delta` 事件,`llm_reasoning` 无新行。
+- [ ] `reasoning_stream=true`(或未设 + env 默认):`enable_thinking == true`,实例有标记,`reasoning-delta` 照常边跑边显示,`llm_reasoning` 有行。
+- [ ] `LOCAL_LLM_ENABLE_THINKING=false` 且 profile 未设 → 行为等同 Off;profile 显式 `true` 可**覆盖** env。
+- [ ] 非 `local:` 模型不受该开关影响(无 `extra_body.enable_thinking` 注入)。
+
+---
+
 ## 11. 环境变量清单(最终)
 
 ```
@@ -296,6 +322,8 @@ CREATE INDEX IF NOT EXISTS ix_llm_reasoning_thread_time ON llm_reasoning (thread
 DATABASE_URI=postgres://…            # 必填:唯一持久化;缺失/不可达 → 启动 fail-closed,无 InMemory/文件降级
 # 模型(多 provider 任选其一,make_model 解析)
 ANTHROPIC_API_KEY=…                  # 或 OPENAI_*/FIREWORKS_*/gateway
+# 推理流开关(§10.6):仅 local: 模型;profile 的 reasoning_stream 优先于此
+LOCAL_LLM_ENABLE_THINKING=true       # 缺省开;false=默认不生成/不推送推理流(仍可被 profile 覆盖)
 # 完成 webhook(相对路径 → 进程内 loopback 投递,§8.1;token 必填)
 COMPLETION_WEBHOOK_URL=/webhooks/run-complete
 RUN_COMPLETE_WEBHOOK_SECRET=…
@@ -323,11 +351,13 @@ OPEN_SWE_QUEUE_DEBUG=1
 8. **交付物 = 本地分支 commit**;push/PR 永远不作为默认行为,仅用户显式要求 + 宿主凭据可用时才 push。
 9.5 **LLM 调用有界**:全进程同一时刻进行中的 LLM 调用 ≤ `OPEN_SWE_LLM_MAX_CONCURRENCY`;等待在进程内 FIFO 队列,排队时间不计模型超时。
 10. **认证面单一**:静态 token(`hmac.compare_digest`)或显式开放本地;不存在 GitHub/OIDC/Slack 任何登录路径。
+11. **推理流单一事实源**(§10.6):`local:` 模型的思考由**一个** `reasoning_stream` 解析值同时决定 `enable_thinking`(拉取)与 reasoning-capture 标记(显示/推送);`provider_model_kwargs` 不得再自行注入 `enable_thinking`。profile 未设 → 继承 `LOCAL_LLM_ENABLE_THINKING` 部署默认(开),行为向后兼容。
 
 **最小复刻验收(本变体)**:
 - [ ] `langgraph.json` 仅 `agent` + `scheduler` + `http.app` + Postgres checkpointer/store + TTL 可启动
 - [ ] **持久化唯一性**:`DATABASE_URI` 未设或 Postgres 不可达 → 进程启动即失败(无 InMemory 运行);代码中 grep 不到 `InMemorySaver`/`InMemoryStore` 运行时引用
 - [ ] **推理消息**(§7.1):带推理的 run 结束后 `llm_reasoning` 有对应行;`/state` 与 `/history` 的 messages 里 grep 不到 reasoning/thinking 内容;实时流中推理仍边跑边显示;重复 upsert 不产生重复行;Postgres 写入失败时 run 不失败(仅 warning)
+- [ ] **推理流开关**(§10.6):profile `reasoning_stream=false` 的 run 不发 `reasoning-delta`、`enable_thinking=false`、`llm_reasoning` 无新行;`true`/缺省(env 默认开)行为与现状一致;非 `local:` 模型不受影响
 - [ ] `pin_single_event_loop` 在 import 期生效且可拒绝启动
 - [ ] `dispatch_agent_run` 六参数契约 + 完成 webhook 幂等(**无** GitHub 触发源);`disable_loopback=false` 下 run 终结经**进程内** POST 到达 `/webhooks/run-complete`(`?token=` 错误 → 401/403),全程无公网回调
 - [ ] 静态 token 认证:带 token 200 / 缺 token 401;开放本地模式仅在 `OPEN_SWE_ALLOW_ANON=1` 生效
@@ -342,7 +372,7 @@ OPEN_SWE_QUEUE_DEBUG=1
 
 | 状态 | 文件 |
 |---|---|
-| 改 | `langgraph.json`(两图)、`agent/api/app.py`(auth 钩子 + 路由裁剪)、`agent/prompt.py`(本地提交段)、`agent/server.py`(沙箱去 proxy + 工具列表)、`agent/dispatch.py`(source 收窄)、`agent/completion.py`(失败回执简化)、`agent/scheduler.py`(去 baby_sit/cost)、`agent/middleware/strip_thoughts.py`(剥离前先把推理写入 `llm_reasoning`,§7.1) |
+| 改 | `langgraph.json`(两图)、`agent/api/app.py`(auth 钩子 + 路由裁剪)、`agent/prompt.py`(本地提交段)、`agent/server.py`(沙箱去 proxy + 工具列表 + `reasoning_stream` 透传 §10.6)、`agent/utils/model.py`(`make_model` 加 `reasoning_stream` 开关 §10.6)、`agent/dispatch.py`(source 收窄)、`agent/completion.py`(失败回执简化)、`agent/scheduler.py`(去 baby_sit/cost)、`agent/middleware/strip_thoughts.py`(剥离前先把推理写入 `llm_reasoning`,§7.1) |
 | 新增 | `agent/reasoning_store.py`(§7.1 `llm_reasoning` 表 DDL/upsert/TTL 清扫,唯一写者) |
 | 留 | `agent/webapp.py`、`agent/utils/event_loop.py`、`agent/postgres_persistence.py`、`agent/input_messages.py`、`agent/utils/sandbox.py`、`agent/integrations/local.py`(裸开发回退)、`agent/utils/sandbox_paths.py`、`agent/utils/queue_debug.py`、`agent/api/health.py`、`agent/dashboard/{thread_api,plan_api,plan_store,workflow_approval_api}.py`、`agent/middleware/{sanitize,tool_error,exclude_tools,model_call_limit,model_call_timeout,strip_thoughts,prepare_run}.py`、`agent/tools/{web_search,fetch_url,http_request,save_plan,approve_plan,enter_plan_mode,schedule_thread_wakeup,background_execute,background_task,recreate_sandbox,sandbox_reset,report_platform_issue,read_user_settings,save_user_instructions,save_user_skill,delete_user_skill,output_iframe,read_repo_file*,search_repo_code*}.py` |
 | 改语义 | `agent/local_auth.py`(从死代码→接上,作为认证入口)、`agent/utils/repo.py`(仅本地仓库解析) |
