@@ -74,6 +74,7 @@ from .dashboard.agent_overrides import (
     normalize_profile_overrides,
     normalize_profile_subagent_overrides,
     profile_draft_prs,
+    profile_reasoning_stream,
     resolve_github_login,
 )
 from .dashboard.agent_usage import record_agent_run_usage
@@ -1190,10 +1191,16 @@ async def _make_model_or_defer(
     model_id: str,
     *,
     use_gateway: bool,
+    reasoning_stream: bool | None = None,
     **kwargs: Any,
 ) -> BaseChatModel:
     try:
-        return await make_model(model_id, use_gateway=use_gateway, **kwargs)
+        return await make_model(
+            model_id,
+            use_gateway=use_gateway,
+            reasoning_stream=reasoning_stream,
+            **kwargs,
+        )
     except Exception as e:  # noqa: BLE001
         logger.warning("Deferring model setup failure for %s", model_id, exc_info=True)
         return make_deferred_error_model(e, model_id=model_id)
@@ -1441,6 +1448,7 @@ async def get_agent(config: RunnableConfig) -> Pregel:
         use_gateway = False
         profile = None
         fable_enabled = False
+        reasoning_stream: bool | None = None
     else:
         async with aphase(thread_id, "factory.settings_defaults"):
             (
@@ -1456,6 +1464,8 @@ async def get_agent(config: RunnableConfig) -> Pregel:
                 _cached_profile(None if thread_settings.get("model_id") else settings_login),
                 _cached_fable_enabled(),
             )
+        # 推理流开关来自线程属主的 profile（未设置 -> None，继承部署默认）。
+        reasoning_stream = profile_reasoning_stream(profile)
 
     linear_issue = as_json_object(configurable.get("linear_issue"))
     linear_project_id = linear_issue.get("linear_project_id", "")
@@ -1588,7 +1598,10 @@ async def get_agent(config: RunnableConfig) -> Pregel:
         fallback_middleware.append(
             ModelFallbackMiddleware(
                 await _make_model_or_defer(
-                    fallback_model_id, use_gateway=use_gateway, **fallback_kwargs
+                    fallback_model_id,
+                    use_gateway=use_gateway,
+                    reasoning_stream=reasoning_stream,
+                    **fallback_kwargs,
                 )
             )
         )
@@ -1738,10 +1751,13 @@ async def get_agent(config: RunnableConfig) -> Pregel:
             )
             skill_sources.insert(0, USER_SKILLS_ROUTE)
     agent_backend = CompositeBackend(default=backend, routes=skill_routes)
-    main_model = await _make_model_or_defer(model_id, use_gateway=use_gateway, **model_kwargs)
+    main_model = await _make_model_or_defer(
+        model_id, use_gateway=use_gateway, reasoning_stream=reasoning_stream, **model_kwargs
+    )
     subagent_model = await _make_model_or_defer(
         subagent_model_id,
         use_gateway=use_gateway,
+        reasoning_stream=reasoning_stream,
         **subagent_model_kwargs,
     )
     subagent_tools = [
@@ -1752,6 +1768,7 @@ async def get_agent(config: RunnableConfig) -> Pregel:
     title_model = await _make_model_or_defer(
         title_model_id,
         use_gateway=use_gateway,
+        reasoning_stream=reasoning_stream,
         **title_model_kwargs,
     )
     return create_deep_agent(

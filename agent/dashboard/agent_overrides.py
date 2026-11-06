@@ -91,6 +91,17 @@ def profile_draft_prs(profile: dict[str, Any] | None) -> bool:
     return value if isinstance(value, bool) else True
 
 
+def profile_reasoning_stream(profile: dict[str, Any] | None) -> bool | None:
+    """The user's local-LLM reasoning-stream toggle; ``None`` means unset.
+
+    ``None`` inherits the ``LOCAL_LLM_ENABLE_THINKING`` deployment default
+    (resolved in ``make_model``), so profiles written before the toggle
+    existed behave exactly as before.
+    """
+    value = profile.get("reasoning_stream") if isinstance(profile, dict) else None
+    return value if isinstance(value, bool) else None
+
+
 def _normalize_profile_model_pair(
     profile: dict[str, Any],
     *,

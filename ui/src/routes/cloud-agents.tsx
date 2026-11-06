@@ -305,6 +305,8 @@ function CloudAgentsPage() {
         </div>
       </SettingsSection>
 
+      <ReasoningStreamSection profile={profile.data} persist={persist} />
+
       <SettingsSection title="Rules">
         <SettingsNavRow
           to="/agents/instructions"
@@ -322,5 +324,58 @@ function CloudAgentsPage() {
 
       {error && <p className="text-xs text-destructive">{error}</p>}
     </AppShell>
+  )
+}
+
+type ReasoningStreamMode = "inherit" | "on" | "off"
+
+function reasoningStreamMode(value: boolean | null | undefined): ReasoningStreamMode {
+  if (value === true) return "on"
+  if (value === false) return "off"
+  return "inherit"
+}
+
+function reasoningStreamModeValue(mode: ReasoningStreamMode): boolean | null {
+  if (mode === "on") return true
+  if (mode === "off") return false
+  return null
+}
+
+function ReasoningStreamSection({
+  profile,
+  persist,
+}: {
+  profile: ReturnType<typeof useProfile>["data"]
+  persist: (patch: Parameters<typeof buildProfileUpdate>[1]) => void
+}) {
+  return (
+    <SettingsSection
+      title="Reasoning Stream"
+      description="Controls whether the local LLM's reasoning stream is pulled and shown. Off sends enable_thinking=false so the model stops generating thinking, and reasoning content is no longer streamed into the conversation."
+    >
+      <div className="divide-y divide-border">
+        <SettingsRow
+          label="Show and stream reasoning"
+          description="Inherit uses the LOCAL_LLM_ENABLE_THINKING deployment default (on). Applies to local models (local:) only."
+          control={
+            <Select
+              value={reasoningStreamMode(profile?.reasoning_stream)}
+              onValueChange={(next) =>
+                persist({ reasoning_stream: reasoningStreamModeValue(next as ReasoningStreamMode) })
+              }
+            >
+              <SelectTrigger className="w-48">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="inherit">Inherit deployment default</SelectItem>
+                <SelectItem value="on">On</SelectItem>
+                <SelectItem value="off">Off</SelectItem>
+              </SelectContent>
+            </Select>
+          }
+        />
+      </div>
+    </SettingsSection>
   )
 }
