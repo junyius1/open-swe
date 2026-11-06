@@ -151,6 +151,7 @@ export interface Profile {
   auto_fix_ci?: boolean
   draft_prs?: boolean
   review_draft_prs?: boolean | null
+  reasoning_stream?: boolean | null
   updated_at?: string
 }
 
@@ -165,6 +166,7 @@ export interface ProfileUpdate {
   auto_fix_ci?: boolean
   draft_prs?: boolean
   review_draft_prs?: boolean | null
+  reasoning_stream?: boolean | null
 }
 
 export interface TeamSettings {

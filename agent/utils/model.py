@@ -416,6 +416,26 @@ def install_local_reasoning_patch() -> None:
     _local_reasoning_installed = True
 
 
+def local_reasoning_env_default() -> bool:
+    """Deployment default for the local-LLM reasoning stream (``LOCAL_LLM_ENABLE_THINKING``)."""
+    return os.environ.get("LOCAL_LLM_ENABLE_THINKING", "true").lower() in ("true", "1")
+
+
+def resolve_local_reasoning_stream(reasoning_stream: bool | None) -> bool:
+    """Resolve whether the local-LLM reasoning stream is on.
+
+    An explicit value (the per-user ``reasoning_stream`` setting) is
+    authoritative; ``None`` inherits the ``LOCAL_LLM_ENABLE_THINKING``
+    deployment default (on). One resolved value drives both halves of the
+    pipeline: the ``enable_thinking`` request field (whether the LLM generates
+    thinking at all) and the reasoning-capture marker (whether thinking is
+    surfaced as ``reasoning-delta`` events the dashboard displays and pushes).
+    """
+    if reasoning_stream is None:
+        return local_reasoning_env_default()
+    return reasoning_stream
+
+
 def _coerce_openai_chat_completions_kwargs(model_kwargs: dict[str, object]) -> None:
     if model_kwargs.get("use_responses_api") is not False:
         return
@@ -439,7 +459,11 @@ def _configure_openai_responses_kwargs(model_kwargs: dict[str, object]) -> None:
 
 
 async def make_model(
-    model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpack[ModelKwargs]
+    model_id: str,
+    *,
+    use_gateway: bool | None = None,
+    reasoning_stream: bool | None = None,
+    **kwargs: Unpack[ModelKwargs],
 ) -> BaseChatModel:
     """Build a chat model, optionally routed through the LangSmith LLM Gateway.
 
@@ -450,6 +474,13 @@ async def make_model(
     the ``local:`` branch performs an async ``/models`` read (model construction
     happens inside the run's event loop, where blocking sockets are rejected by
     langgraph's blockbuster guard), so callers must ``await`` it.
+
+    ``reasoning_stream`` gates the local-LLM reasoning pipeline (``local:``
+    models only): when on, the request carries ``enable_thinking`` and the
+    model instance is marked so its thinking streams to the dashboard as
+    reasoning events; when off, thinking is disabled and nothing is
+    captured. ``None`` inherits the ``LOCAL_LLM_ENABLE_THINKING`` env
+    default.
     """
     model_kwargs: dict[str, object] = dict(kwargs)
     model_kwargs.setdefault("max_retries", DEFAULT_MAX_RETRIES)
@@ -469,22 +500,17 @@ async def make_model(
         model_kwargs.pop("thinking", None)
         model_kwargs.pop("effort", None)
 
-        # 👈 【新增以下逻辑】：注入 Qwen/DashScope/vLLM 的思考开关
+        # 推理流开关：显式参数优先，否则继承 LOCAL_LLM_ENABLE_THINKING 部署默认（默认开）。
+        # 一个开关同时控制两件事：LLM 是否生成思考（enable_thinking 请求字段，即"拉取"），
+        # 以及思考是否被捕获成 reasoning 流事件推给 dashboard 显示（下方实例标记，即"显示/推送"）。
+        # 显式写 True/False（而非缺省），避免 Qwen 聊天模板的默认思考行为绕过开关。
+        reasoning_enabled = resolve_local_reasoning_stream(reasoning_stream)
         extra_body = dict(model_kwargs.get("extra_body") or {})
-        # 从环境变量或者默认开启思考模式
-        enable_thinking = os.environ.get("LOCAL_LLM_ENABLE_THINKING", "true").lower() in (
-            "true",
-            "1",
-        )
-        if enable_thinking:
-            extra_body["enable_thinking"] = True
-            # 如果是本地 vLLM，部分框架使用 chat_template_kwargs
-            extra_body.setdefault("chat_template_kwargs", {"enable_thinking": True})
-
-        if extra_body:
-            model_kwargs["extra_body"] = extra_body
-
-        install_local_reasoning_patch()
+        extra_body["enable_thinking"] = reasoning_enabled
+        template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
+        template_kwargs["enable_thinking"] = reasoning_enabled
+        extra_body["chat_template_kwargs"] = template_kwargs
+        model_kwargs["extra_body"] = extra_body
 
         local_profile = await _local_llm_model_profile(
             model_name, model_kwargs["base_url"], model_kwargs.get("max_tokens")
@@ -492,14 +518,16 @@ async def make_model(
         if local_profile:
             model_kwargs["profile"] = local_profile
         local_model = init_chat_model(model=model_name, **model_kwargs)
-        # Mark the instance so the reasoning patch only relabels/captures
-        # chunks from local models, leaving other chat-completions models
-        # alone. Unsettable markers (test doubles, proxies) are harmless:
-        # the patch no-ops on instances that carry no marker.
-        try:
-            local_model._open_swe_local_reasoning = True  # type: ignore[attr-defined]
-        except (AttributeError, TypeError):
-            pass
+        if reasoning_enabled:
+            # Mark the instance so the reasoning patch captures its thinking
+            # chunks as reasoning events; unmarked local models stream text and
+            # tool calls only. Unsettable markers (test doubles, proxies) are
+            # harmless: the patch no-ops on instances that carry no marker.
+            install_local_reasoning_patch()
+            try:
+                local_model._open_swe_local_reasoning = True  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                pass
         return local_model
 
     if model_id.startswith("openai:"):
@@ -688,11 +716,8 @@ def provider_model_kwargs(
         effort = fireworks_reasoning_effort_for(profile_effort)
         if effort is not None:
             kwargs["model_kwargs"] = {"reasoning_effort": effort}
-    # 👈 【新增此分支】：处理本地/Qwen 模型的思考开关
-    elif model_id.startswith("local:"):
-        # 只要 profile 没有显式设为 "none"，就打开思考
-        if profile_effort != "none":
-            kwargs["extra_body"] = {"enable_thinking": True}
+    # local: 模型的思考开关由 make_model 的 reasoning_stream 统一处理
+    # （显式参数 > LOCAL_LLM_ENABLE_THINKING 部署默认），这里不再重复设置。
     return kwargs
 
 

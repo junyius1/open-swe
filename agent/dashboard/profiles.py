@@ -44,6 +44,9 @@ class ProfileUpdate(BaseModel):
     auto_fix_ci: bool = True
     draft_prs: bool | None = None
     review_draft_prs: bool | None = None
+    # Tri-state local-LLM reasoning-stream toggle: True/False is authoritative,
+    # None inherits the LOCAL_LLM_ENABLE_THINKING deployment default (on).
+    reasoning_stream: bool | None = None
 
     @model_validator(mode="after")
     def _normalize_stale_model_pairs(self) -> "ProfileUpdate":
@@ -156,6 +159,7 @@ async def upsert_profile(login: str, email: str, update: ProfileUpdate) -> dict[
         "base_branch": update.base_branch,
         "branch_prefix": update.branch_prefix,
         "auto_fix_ci": update.auto_fix_ci,
+        "reasoning_stream": update.reasoning_stream,
         "draft_prs": (
             update.draft_prs if update.draft_prs is not None else existing.get("draft_prs", True)
         ),
