@@ -279,6 +279,17 @@ _LOCAL_REASONING_MARKER = "_open_swe_local_reasoning"
 # DashScope (and some vLLM chat templates) emit ``reasoning_content``,
 # others emit plain ``reasoning``. Both carry the same thinking tokens.
 _LOCAL_REASONING_FIELD_KEYS = ("reasoning_content", "reasoning")
+_LOCAL_REASONING_STREAM_ENV = "LOCAL_LLM_STREAM_REASONING"
+
+
+def local_reasoning_stream_enabled() -> bool:
+    """Whether local-model thinking is captured and streamed to the dashboard.
+
+    Independent of ``LOCAL_LLM_ENABLE_THINKING``: the model can still think
+    while its reasoning is not surfaced (no ``reasoning-delta`` events, no
+    "Thought" blocks). Default on preserves the current behavior.
+    """
+    return os.environ.get(_LOCAL_REASONING_STREAM_ENV, "true").lower() in ("true", "1")
 
 
 def _delta_reasoning_text(chunk: Mapping[str, Any]) -> str | None:
@@ -484,7 +495,9 @@ async def make_model(
         if extra_body:
             model_kwargs["extra_body"] = extra_body
 
-        install_local_reasoning_patch()
+        stream_reasoning = local_reasoning_stream_enabled()
+        if stream_reasoning:
+            install_local_reasoning_patch()
 
         local_profile = await _local_llm_model_profile(
             model_name, model_kwargs["base_url"], model_kwargs.get("max_tokens")
@@ -495,11 +508,14 @@ async def make_model(
         # Mark the instance so the reasoning patch only relabels/captures
         # chunks from local models, leaving other chat-completions models
         # alone. Unsettable markers (test doubles, proxies) are harmless:
-        # the patch no-ops on instances that carry no marker.
-        try:
-            local_model._open_swe_local_reasoning = True  # type: ignore[attr-defined]
-        except (AttributeError, TypeError):
-            pass
+        # the patch no-ops on instances that carry no marker. Skipping the
+        # marker when streaming is off lets the model still think without
+        # surfacing "Thought" blocks in the dashboard.
+        if stream_reasoning:
+            try:
+                local_model._open_swe_local_reasoning = True  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                pass
         return local_model
 
     if model_id.startswith("openai:"):

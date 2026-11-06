@@ -306,6 +306,7 @@ CREATE INDEX IF NOT EXISTS ix_llm_reasoning_thread_time ON llm_reasoning (thread
 - **接线**:`get_agent()`(`agent/server.py`)按线程属主 profile 解析一次 `reasoning_stream`,透传给主模型 / 子代理 / 标题 / fallback 四个 `make_model` 构建点(与 `use_gateway` 同一透传模式)。**仅 `local:` 模型生效**,其它 provider 不受影响。
 - **与 §7.1 的关系(不冲突)**:§7.1 是**持久化/懒加载**(把已生成的思考全文另存 `llm_reasoning` 表、UI 点开才拉);本节是**源头开关**(要不要生成、要不要流式显示)。开关 Off 时既无流式 `reasoning-delta`,也无 `llm_reasoning` 新行(没有思考可存);开关 On/Inherit 时两者照常。`strip_thoughts.py` 的 checkpoint 剥离逻辑**不受开关影响**(始终剥离)。
 - **注意**:`provider_model_kwargs()` 里原有的 `local:` `enable_thinking` 注入**删除**,改由本开关统一处理(否则两处各写一次会互相覆盖)。
+- **部署级"仅显示"开关(已实现)**:`LOCAL_LLM_STREAM_REASONING`(缺省 `true`)独立于 `LOCAL_LLM_ENABLE_THINKING`,只控**显示/推送**半:关闭时不打 `_open_swe_local_reasoning` 标记、不装 reasoning patch → 无 `reasoning-delta` 流事件、UI 不渲染 Thought 块,但 `enable_thinking` 不受影响,模型仍在内部思考。`provider_model_kwargs()` 的 `local:` 分支注入的 `enable_thinking` 同样不受此开关影响。它满足"要思考、但不想在 UI 看到推理流"的场景,与上文按线程属主 profile 的 `reasoning_stream` 设计不冲突(profile 落地后两者叠加:profile 优先于该 env 默认)。
 
 **验收**:
 - [ ] profile `reasoning_stream=false` 的 run:`extra_body.enable_thinking == false`,model 实例**无** `_open_swe_local_reasoning` 标记,流中无 `reasoning-delta` 事件,`llm_reasoning` 无新行。
@@ -324,6 +325,8 @@ DATABASE_URI=postgres://…            # 必填:唯一持久化;缺失/不可达
 ANTHROPIC_API_KEY=…                  # 或 OPENAI_*/FIREWORKS_*/gateway
 # 推理流开关(§10.6):仅 local: 模型;profile 的 reasoning_stream 优先于此
 LOCAL_LLM_ENABLE_THINKING=true       # 缺省开;false=默认不生成/不推送推理流(仍可被 profile 覆盖)
+# 推理"显示"开关(§10.6,独立于上一个):仅 local: 模型;控制是否把思考捕获/流式推送到 UI
+LOCAL_LLM_STREAM_REASONING=true      # 缺省开;false=模型照常思考(仍受 LOCAL_LLM_ENABLE_THINKING 控制)但不发 reasoning-delta、UI 不显示 Thought 块
 # 完成 webhook(相对路径 → 进程内 loopback 投递,§8.1;token 必填)
 COMPLETION_WEBHOOK_URL=/webhooks/run-complete
 RUN_COMPLETE_WEBHOOK_SECRET=…
